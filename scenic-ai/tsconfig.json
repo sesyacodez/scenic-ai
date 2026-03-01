@@ -9,6 +9,7 @@
     "esModuleInterop": true,
     "module": "esnext",
     "moduleResolution": "bundler",
+    "types": ["node", "react", "react-dom"],
     "resolveJsonModule": true,
     "isolatedModules": true,
     "jsx": "react-jsx",

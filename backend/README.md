@@ -2,6 +2,11 @@
 
 FastAPI backend for ScenicAI demo.
 
+## Environment
+
+- Copy `.env.example` to `.env`
+- Set `MAPBOX_ACCESS_TOKEN`
+
 ## Run
 
 ```bash

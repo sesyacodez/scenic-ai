@@ -1,16 +1,50 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ScenicMap } from "@/components/scenic-map";
 
-type PreferenceKey = "nature" | "water" | "historic" | "quiet";
+type PreferenceKey = "nature" | "water" | "historic" | "quiet" | "viewpoints" | "culture" | "cafes";
 
 type Preferences = Record<PreferenceKey, boolean>;
 
 type SessionState = {
-  schemaVersion: 1;
+  schemaVersion: 2;
   durationMinutes: number;
   preferences: Preferences;
   refineText: string;
+};
+
+type LegacySessionState = {
+  schemaVersion: 1;
+  durationMinutes: number;
+  preferences: Partial<Preferences>;
+  refineText: string;
+};
+
+type GeneratedRoute = {
+  id: string;
+  distanceMeters: number;
+  durationSeconds: number;
+  scenicScore: number;
+  geometry: {
+    type: "LineString";
+    coordinates: number[][];
+  };
+};
+
+type GenerateResponse = {
+  selectedRouteId: string | null;
+  routes: GeneratedRoute[];
+  explanation: {
+    summary: string;
+    reasons: string[];
+  };
+};
+
+type GeoOrigin = {
+  lat: number;
+  lng: number;
+  accuracy: number;
 };
 
 const STORAGE_KEY = "scenicai.session";
@@ -19,11 +53,14 @@ const defaultPreferences: Preferences = {
   nature: true,
   water: false,
   historic: false,
-  quiet: true,
+  quiet: false,
+  viewpoints: false,
+  culture: false,
+  cafes: false,
 };
 
 const defaultState: SessionState = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   durationMinutes: 45,
   preferences: defaultPreferences,
   refineText: "",
@@ -32,49 +69,240 @@ const defaultState: SessionState = {
 const MIN_SIDEBAR_WIDTH = 280;
 const MAX_SIDEBAR_WIDTH = 460;
 const DEFAULT_SIDEBAR_WIDTH = 308;
+const MAX_ACCEPTABLE_ACCURACY_METERS = 250;
+
+const resolveBackendBaseUrl = () => {
+  if (process.env.NEXT_PUBLIC_BACKEND_BASE_URL) {
+    return process.env.NEXT_PUBLIC_BACKEND_BASE_URL;
+  }
+
+  if (typeof window !== "undefined") {
+    const protocol = window.location.protocol === "https:" ? "https" : "http";
+    return `${protocol}://${window.location.hostname}:8000`;
+  }
+
+  return "http://127.0.0.1:8000";
+};
 
 export function ScenicPlannerShell() {
   const shellRef = useRef<HTMLDivElement>(null);
-  const [sessionState, setSessionState] = useState<SessionState>(() => {
-    if (typeof window === "undefined") {
-      return defaultState;
-    }
-
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) {
-      return defaultState;
-    }
-
-    try {
-      const parsed = JSON.parse(raw) as SessionState;
-      if (parsed.schemaVersion !== 1) {
-        return defaultState;
-      }
-      return parsed;
-    } catch {
-      window.localStorage.removeItem(STORAGE_KEY);
-      return defaultState;
-    }
-  });
-  const [status, setStatus] = useState<"idle" | "generating">("idle");
+  const backendBaseUrl = useMemo(() => resolveBackendBaseUrl(), []);
+  const [sessionState, setSessionState] = useState<SessionState>(defaultState);
+  const [isStorageReady, setIsStorageReady] = useState(false);
+  const [status, setStatus] = useState<"idle" | "generating" | "refining">("idle");
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
+  const [originLat, setOriginLat] = useState("");
+  const [originLng, setOriginLng] = useState("");
+  const [requestError, setRequestError] = useState<string | null>(null);
+  const [locationNote, setLocationNote] = useState<string | null>(null);
+  const [routeTitle, setRouteTitle] = useState("Scenic Route");
+  const [routeMeta, setRouteMeta] = useState("—");
+  const [scenicScore, setScenicScore] = useState<number | null>(null);
+  const [explanationText, setExplanationText] = useState(
+    "Generate a route to see AI reasoning grounded in scored alternatives.",
+  );
+  const [selectedRouteCoordinates, setSelectedRouteCoordinates] = useState<number[][] | null>(null);
+  const [mapCenter, setMapCenter] = useState<[number, number]>([-0.1278, 51.5074]);
 
   const { durationMinutes, preferences, refineText } = sessionState;
 
   useEffect(() => {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) {
+      setIsStorageReady(true);
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(raw) as SessionState | LegacySessionState;
+      if (parsed.schemaVersion === 2) {
+        setSessionState({
+          ...parsed,
+          preferences: { ...defaultPreferences, ...parsed.preferences },
+        });
+      } else if (parsed.schemaVersion === 1) {
+        setSessionState({
+          schemaVersion: 2,
+          durationMinutes: parsed.durationMinutes,
+          preferences: { ...defaultPreferences, ...parsed.preferences },
+          refineText: parsed.refineText,
+        });
+      } else {
+        window.localStorage.removeItem(STORAGE_KEY);
+      }
+    } catch {
+      window.localStorage.removeItem(STORAGE_KEY);
+    } finally {
+      setIsStorageReady(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isStorageReady) {
+      return;
+    }
+
     const state: SessionState = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       durationMinutes,
       preferences,
       refineText,
     };
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-  }, [durationMinutes, preferences, refineText]);
+  }, [durationMinutes, isStorageReady, preferences, refineText]);
 
   const selectedPreferences = useMemo(
     () => Object.entries(preferences).filter(([, enabled]) => enabled).map(([key]) => key),
     [preferences],
   );
+
+  const resolveManualOrigin = (): { lat: number; lng: number } | null => {
+    const latText = originLat.trim();
+    const lngText = originLng.trim();
+    if (!latText || !lngText) {
+      return null;
+    }
+
+    const latValue = Number(latText);
+    const lngValue = Number(lngText);
+
+    if (!Number.isFinite(latValue) || !Number.isFinite(lngValue)) {
+      return null;
+    }
+
+    if (latValue < -90 || latValue > 90 || lngValue < -180 || lngValue > 180) {
+      return null;
+    }
+
+    return { lat: latValue, lng: lngValue };
+  };
+
+  const isLikelyNullIsland = (lat: number, lng: number) => {
+    return Math.abs(lat) < 0.001 && Math.abs(lng) < 0.001;
+  };
+
+  const getOnePosition = async (options: PositionOptions): Promise<GeoOrigin | null> => {
+    if (!navigator.geolocation) {
+      return null;
+    }
+
+    return new Promise((resolve) => {
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          const lat = position.coords.latitude;
+          const lng = position.coords.longitude;
+
+          if (isLikelyNullIsland(lat, lng)) {
+            resolve(null);
+            return;
+          }
+
+          resolve({
+            lat,
+            lng,
+            accuracy: position.coords.accuracy,
+          });
+        },
+        () => resolve(null),
+        options,
+      );
+    });
+  };
+
+  const resolveBrowserGeolocation = async (preferFresh = false): Promise<GeoOrigin | null> => {
+    const attempts: PositionOptions[] = preferFresh
+      ? [
+          { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 },
+          { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 },
+          { enableHighAccuracy: false, timeout: 8000, maximumAge: 0 },
+        ]
+      : [
+          { enableHighAccuracy: true, timeout: 10000, maximumAge: 15000 },
+          { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 },
+          { enableHighAccuracy: false, timeout: 8000, maximumAge: 30000 },
+        ];
+
+    let bestFix: GeoOrigin | null = null;
+
+    for (const options of attempts) {
+      const fix = await getOnePosition(options);
+      if (!fix) {
+        continue;
+      }
+
+      if (!bestFix || fix.accuracy < bestFix.accuracy) {
+        bestFix = fix;
+      }
+
+      if (fix.accuracy <= MAX_ACCEPTABLE_ACCURACY_METERS) {
+        return fix;
+      }
+    }
+
+    return bestFix;
+  };
+
+  const resolveOrigin = async (): Promise<GeoOrigin | null> => {
+    const manualOrigin = resolveManualOrigin();
+    if (manualOrigin) {
+      return { ...manualOrigin, accuracy: 0 };
+    }
+
+    return resolveBrowserGeolocation(true);
+  };
+
+  const toPreferenceWeights = () => ({
+    nature: preferences.nature ? 1 : 0,
+    water: preferences.water ? 1 : 0,
+    historic: preferences.historic ? 1 : 0,
+    quiet: preferences.quiet ? 1 : 0,
+    viewpoints: preferences.viewpoints ? 1 : 0,
+    culture: preferences.culture ? 1 : 0,
+    cafes: preferences.cafes ? 1 : 0,
+  });
+
+  const preferenceButtonOrder: PreferenceKey[] = [
+    "nature",
+    "water",
+    "historic",
+    "quiet",
+    "viewpoints",
+    "culture",
+    "cafes",
+  ];
+
+  const preferenceLabels: Record<PreferenceKey, string> = {
+    nature: "Nature",
+    water: "Water",
+    historic: "Historic",
+    quiet: "Quiet",
+    viewpoints: "Viewpoints",
+    culture: "Culture",
+    cafes: "Cafes",
+  };
+
+  const applyRouteResponse = (
+    payload: GenerateResponse,
+    origin: { lat: number; lng: number },
+    fallbackNoRouteMessage: string,
+  ) => {
+    if (payload.routes.length === 0 || payload.selectedRouteId === null) {
+      setExplanationText(payload.explanation.summary);
+      setRequestError(fallbackNoRouteMessage);
+      return;
+    }
+
+    const selected = payload.routes.find((route) => route.id === payload.selectedRouteId) ?? payload.routes[0];
+    const distanceKm = (selected.distanceMeters / 1000).toFixed(1);
+    const minutes = Math.round(selected.durationSeconds / 60);
+
+    setRouteTitle(`Route ${selected.id.replace("route_", "#")}`);
+    setRouteMeta(`${distanceKm} km ・ ${minutes} min walk`);
+    setScenicScore(selected.scenicScore);
+    setExplanationText(payload.explanation.summary);
+    setSelectedRouteCoordinates(selected.geometry.coordinates);
+    setMapCenter([origin.lng, origin.lat]);
+  };
 
   const togglePreference = (key: PreferenceKey) => {
     setSessionState((prev) => ({
@@ -83,11 +311,124 @@ export function ScenicPlannerShell() {
     }));
   };
 
-  const handleGenerate = () => {
+  const handleGenerate = async () => {
+    setRequestError(null);
+    setLocationNote(null);
     setStatus("generating");
-    window.setTimeout(() => {
+
+    const origin = await resolveOrigin();
+    if (!origin) {
       setStatus("idle");
-    }, 1000);
+      setRequestError("Location unavailable. Enter latitude/longitude or allow geolocation.");
+      return;
+    }
+
+    if (origin.accuracy > MAX_ACCEPTABLE_ACCURACY_METERS) {
+      setLocationNote(
+        `Low GPS accuracy (~${Math.round(origin.accuracy)}m). You can retry Use my location for a better fix.`,
+      );
+    }
+
+    try {
+      const response = await fetch(`${backendBaseUrl}/api/v1/route/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          origin,
+          durationMinutes,
+          preferences: toPreferenceWeights(),
+          constraints: { avoidBusyRoads: preferences.quiet },
+          sessionId: "anon-web-session",
+          refinementText: refineText || undefined,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Backend returned ${response.status}`);
+      }
+
+      const payload = (await response.json()) as GenerateResponse;
+      applyRouteResponse(payload, origin, "No route could be generated.");
+    } catch (error) {
+      if (error instanceof TypeError) {
+        setRequestError(`Failed to fetch ${backendBaseUrl}. Verify backend is running and CORS is enabled.`);
+      } else {
+        setRequestError(error instanceof Error ? error.message : "Failed to generate route");
+      }
+    } finally {
+      setStatus("idle");
+    }
+  };
+
+  const handleRefine = async () => {
+    const message = refineText.trim();
+    if (!message) {
+      setRequestError("Enter a refinement instruction first.");
+      return;
+    }
+
+    setRequestError(null);
+    setStatus("refining");
+
+    const origin = await resolveOrigin();
+    if (!origin) {
+      setStatus("idle");
+      setRequestError("Location unavailable. Enter latitude/longitude or allow geolocation.");
+      return;
+    }
+
+    try {
+      const response = await fetch(`${backendBaseUrl}/api/v1/route/refine`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: "anon-web-session",
+          message,
+          origin,
+          durationMinutes,
+          preferences: toPreferenceWeights(),
+          constraints: { avoidBusyRoads: preferences.quiet },
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Backend returned ${response.status}`);
+      }
+
+      const payload = (await response.json()) as GenerateResponse;
+      applyRouteResponse(payload, origin, payload.explanation.summary);
+    } catch (error) {
+      if (error instanceof TypeError) {
+        setRequestError(`Failed to fetch ${backendBaseUrl}. Verify backend is running and CORS is enabled.`);
+      } else {
+        setRequestError(error instanceof Error ? error.message : "Failed to refine route");
+      }
+    } finally {
+      setStatus("idle");
+    }
+  };
+
+  const handleUseMyLocation = async () => {
+    setRequestError(null);
+    setLocationNote(null);
+
+    const origin = await resolveBrowserGeolocation(true);
+    if (!origin) {
+      setRequestError("Could not resolve your location. Check browser location permissions.");
+      return;
+    }
+
+    if (origin.accuracy > MAX_ACCEPTABLE_ACCURACY_METERS) {
+      setLocationNote(
+        `Location found with low accuracy (~${Math.round(origin.accuracy)}m). Move to open sky and retry for better precision.`,
+      );
+    } else {
+      setLocationNote(`Location locked (~${Math.round(origin.accuracy)}m accuracy).`);
+    }
+
+    setOriginLat(origin.lat.toFixed(5));
+    setOriginLng(origin.lng.toFixed(5));
+    setMapCenter([origin.lng, origin.lat]);
   };
 
   const clampSidebarWidth = useCallback((value: number) => {
@@ -163,10 +504,27 @@ export function ScenicPlannerShell() {
           <div className="mt-10 space-y-6">
             <section>
               <p className="text-sm font-medium">Starting Point</p>
-              <div className="mt-3 flex h-9 items-center rounded-xl border border-panel-border bg-white px-3 text-sm text-app-foreground/85">
-                <span className="mr-2 text-app-muted">◉</span>
-                142 Riverfront Ave, Downtown
+              <div className="mt-3 grid grid-cols-2 gap-2">
+                <input
+                  value={originLat}
+                  onChange={(event) => setOriginLat(event.target.value)}
+                  placeholder="Latitude"
+                  className="h-9 rounded-xl border border-panel-border bg-white px-3 text-sm"
+                />
+                <input
+                  value={originLng}
+                  onChange={(event) => setOriginLng(event.target.value)}
+                  placeholder="Longitude"
+                  className="h-9 rounded-xl border border-panel-border bg-white px-3 text-sm"
+                />
               </div>
+              <button
+                type="button"
+                onClick={handleUseMyLocation}
+                className="mt-2 h-8 w-full rounded-lg border border-panel-border bg-white text-xs"
+              >
+                Use my location
+              </button>
             </section>
 
             <section>
@@ -199,7 +557,7 @@ export function ScenicPlannerShell() {
             <section>
               <p className="text-sm font-medium">Vibe &amp; Scenery</p>
               <div className="mt-3 grid grid-cols-2 gap-2">
-                {(["nature", "water", "historic", "quiet"] as const).map((key) => {
+                {preferenceButtonOrder.map((key) => {
                   const enabled = preferences[key];
                   return (
                     <button
@@ -213,7 +571,7 @@ export function ScenicPlannerShell() {
                       }`}
                       aria-pressed={enabled}
                     >
-                      {key}
+                      {preferenceLabels[key]}
                     </button>
                   );
                 })}
@@ -225,23 +583,31 @@ export function ScenicPlannerShell() {
               onClick={handleGenerate}
               className="h-10 w-full rounded-xl bg-app-foreground text-sm font-semibold text-panel"
             >
-              {status === "generating" ? "Generating scenic route..." : "Generate Scenic Route"}
+              {status === "generating"
+                ? "Generating scenic route..."
+                : status === "refining"
+                  ? "Refining route..."
+                  : "Generate Scenic Route"}
             </button>
+
+            {requestError ? <p className="text-xs text-red-600">{requestError}</p> : null}
+            {locationNote ? <p className="text-xs text-amber-700">{locationNote}</p> : null}
 
             <section className="space-y-3 border-t border-panel-border pt-4">
               <div className="flex items-start justify-between gap-3">
                 <div>
-                  <p className="text-[22px] font-medium leading-tight">Riverside Botanical Loop</p>
-                  <p className="text-sm text-app-muted">3.8 km ・ 42 min walk</p>
+                  <p className="text-[22px] font-medium leading-tight">{routeTitle}</p>
+                  <p className="text-sm text-app-muted">{routeMeta}</p>
                 </div>
                 <div className="rounded-xl bg-accent/10 px-3 py-2 text-right text-accent">
-                  <p className="text-2xl font-semibold leading-none">94</p>
+                  <p className="text-2xl font-semibold leading-none">
+                    {scenicScore !== null ? Math.round(scenicScore) : "--"}
+                  </p>
                   <p className="text-[10px] font-semibold uppercase tracking-wide">Scenic</p>
                 </div>
               </div>
               <div className="rounded-xl border border-panel-border bg-white p-3 text-sm text-app-muted">
-                This route maximizes your time near the water and favors {selectedPreferences.join(", ")} while
-                avoiding busy streets.
+                {explanationText} Preferences: {selectedPreferences.join(", ") || "balanced"}.
               </div>
             </section>
 
@@ -262,6 +628,7 @@ export function ScenicPlannerShell() {
                 />
                 <button
                   type="button"
+                  onClick={handleRefine}
                   className="flex h-7 w-7 items-center justify-center rounded-full bg-app-foreground text-panel"
                   aria-label="Submit refine request"
                 >
@@ -284,48 +651,7 @@ export function ScenicPlannerShell() {
         </div>
 
         <section className="relative h-full flex-1 overflow-hidden bg-panel">
-          <div className="absolute inset-0 scenic-gradient opacity-35" aria-hidden />
-          <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,_var(--color-panel-border)_1px,_transparent_1px)] [background-size:22px_22px] opacity-35" />
-
-          <svg className="absolute inset-0 h-full w-full" viewBox="0 0 1100 760" preserveAspectRatio="none" aria-hidden>
-            <path d="M30 190 C 290 220, 540 250, 1050 285" stroke="currentColor" className="text-panel-border" strokeWidth="6" fill="none" strokeLinecap="round" opacity="0.6" />
-            <path d="M160 95 C 185 260, 205 510, 255 700" stroke="currentColor" className="text-panel-border" strokeWidth="6" fill="none" strokeLinecap="round" opacity="0.55" />
-            <path d="M690 50 C 680 180, 650 430, 610 745" stroke="currentColor" className="text-panel-border" strokeWidth="6" fill="none" strokeLinecap="round" opacity="0.45" />
-            <path d="M0 495 C 310 575, 650 535, 1100 460" stroke="currentColor" className="text-accent" strokeWidth="26" fill="none" strokeLinecap="round" opacity="0.08" />
-
-            <defs>
-              <radialGradient id="routeGlow" cx="50%" cy="30%" r="55%">
-                <stop offset="0%" stopColor="currentColor" className="text-accent" stopOpacity="0.2" />
-                <stop offset="100%" stopColor="currentColor" className="text-accent" stopOpacity="0" />
-              </radialGradient>
-            </defs>
-            <ellipse cx="520" cy="390" rx="260" ry="240" fill="url(#routeGlow)" />
-
-            <path
-              d="M190 425 C 245 220, 530 170, 730 255 C 845 300, 925 385, 965 570"
-              stroke="currentColor"
-              className="text-accent"
-              strokeWidth="6"
-              fill="none"
-              strokeLinecap="round"
-            />
-            <circle cx="190" cy="425" r="14" fill="white" stroke="currentColor" className="text-panel-border" strokeWidth="5" />
-            <circle cx="190" cy="425" r="5" fill="currentColor" className="text-app-foreground" />
-            <circle cx="965" cy="570" r="21" fill="none" stroke="currentColor" className="text-accent" strokeWidth="8" opacity="0.35" />
-            <circle cx="965" cy="570" r="12" fill="none" stroke="currentColor" className="text-accent" strokeWidth="6" />
-          </svg>
-
-          <button className="absolute right-5 top-4 flex h-8 w-8 items-center justify-center rounded-full border border-panel-border bg-white text-xs text-app-muted">
-            N
-          </button>
-          <button className="absolute left-[56%] top-[30%] flex h-8 w-8 items-center justify-center rounded-lg border border-panel-border bg-white text-accent">
-            ☐
-          </button>
-          <div className="absolute bottom-4 right-4 space-y-2">
-            <button className="block h-7 w-7 rounded-lg border border-panel-border bg-white" aria-label="Map control" />
-            <button className="block h-7 w-7 rounded-lg border border-panel-border bg-white" aria-label="Map control" />
-            <button className="block h-7 w-7 rounded-lg border border-panel-border bg-white" aria-label="Map control" />
-          </div>
+          <ScenicMap routeCoordinates={selectedRouteCoordinates} fallbackCenter={mapCenter} />
         </section>
       </div>
     </main>

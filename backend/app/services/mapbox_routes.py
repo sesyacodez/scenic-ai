@@ -1,0 +1,169 @@
+from __future__ import annotations
+
+import math
+import os
+
+import httpx
+
+from app.models import Constraints, Geometry, Location
+
+
+MAPBOX_DIRECTIONS_BASE = "https://api.mapbox.com/directions/v5/mapbox/walking"
+
+
+def _destination_for_walk(origin: Location, distance_meters: float, bearing_deg: float) -> tuple[float, float]:
+    radius = 6_371_000.0
+    bearing = math.radians(bearing_deg)
+    lat1 = math.radians(origin.lat)
+    lon1 = math.radians(origin.lng)
+    delta = distance_meters / radius
+
+    lat2 = math.asin(
+        math.sin(lat1) * math.cos(delta) + math.cos(lat1) * math.sin(delta) * math.cos(bearing)
+    )
+    lon2 = lon1 + math.atan2(
+        math.sin(bearing) * math.sin(delta) * math.cos(lat1),
+        math.cos(delta) - math.sin(lat1) * math.sin(lat2),
+    )
+
+    return (math.degrees(lat2), math.degrees(lon2))
+
+
+async def _request_directions(
+    client: httpx.AsyncClient,
+    token: str,
+    origin: Location,
+    destination: tuple[float, float],
+    use_alternatives: bool,
+) -> list[dict]:
+    destination_lat, destination_lng = destination
+    coordinates = f"{origin.lng},{origin.lat};{destination_lng},{destination_lat}"
+
+    params = {
+        "alternatives": "true" if use_alternatives else "false",
+        "geometries": "geojson",
+        "overview": "full",
+        "steps": "false",
+        "access_token": token,
+    }
+
+    response = await client.get(f"{MAPBOX_DIRECTIONS_BASE}/{coordinates}", params=params)
+    response.raise_for_status()
+    data = response.json()
+
+    if data.get("code") != "Ok":
+        return []
+
+    routes = data.get("routes", [])
+    normalized: list[dict] = []
+
+    for route in routes:
+        geometry_data = route.get("geometry")
+        if not geometry_data or geometry_data.get("type") != "LineString":
+            continue
+
+        normalized.append(
+            {
+                "geometry": Geometry(type="LineString", coordinates=geometry_data.get("coordinates", [])),
+                "distanceMeters": int(route.get("distance", 0)),
+                "durationSeconds": int(route.get("duration", 0)),
+            }
+        )
+
+    return normalized
+
+
+def _dedupe_routes(routes: list[dict]) -> list[dict]:
+    seen: set[tuple[int, int]] = set()
+    result: list[dict] = []
+
+    for route in routes:
+        signature = (route["distanceMeters"], route["durationSeconds"])
+        if signature in seen:
+            continue
+        seen.add(signature)
+        result.append(route)
+
+    return result
+
+
+def _is_valid_route(route: dict) -> bool:
+    geometry = route.get("geometry")
+    coordinates = geometry.coordinates if geometry else []
+    return (
+        isinstance(coordinates, list)
+        and len(coordinates) >= 2
+        and route.get("distanceMeters", 0) > 0
+        and route.get("durationSeconds", 0) > 0
+    )
+
+
+def _route_accuracy_score(route: dict, target_distance: float, target_duration_seconds: int) -> float:
+    distance_error = abs(route["distanceMeters"] - target_distance) / max(target_distance, 1.0)
+    duration_error = abs(route["durationSeconds"] - target_duration_seconds) / max(target_duration_seconds, 1)
+    point_count = len(route["geometry"].coordinates)
+    shape_detail = min(point_count / 40.0, 1.0)
+
+    distance_component = 1.0 - min(distance_error, 1.0)
+    duration_component = 1.0 - min(duration_error, 1.0)
+
+    return 0.48 * distance_component + 0.47 * duration_component + 0.05 * shape_detail
+
+
+async def build_mapbox_routes(
+    origin: Location,
+    duration_minutes: int,
+    constraints: Constraints,
+) -> list[dict]:
+    token = os.getenv("MAPBOX_ACCESS_TOKEN", "").strip()
+    if not token:
+        return []
+
+    target_distance = max(1_200.0, min(9_000.0, duration_minutes * 75.0))
+    target_duration_seconds = duration_minutes * 60
+    candidate_specs = [
+        (25.0, 0.46, True),
+        (100.0, 0.52, True),
+        (175.0, 0.57, False),
+        (255.0, 0.50, False),
+        (325.0, 0.62, False),
+    ]
+    if constraints.avoidBusyRoads:
+        candidate_specs = [
+            (40.0, 0.44, True),
+            (125.0, 0.50, True),
+            (205.0, 0.56, False),
+            (285.0, 0.49, False),
+            (345.0, 0.60, False),
+        ]
+
+    timeout = httpx.Timeout(6.0, connect=3.0)
+    all_routes: list[dict] = []
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for bearing, distance_factor, use_alternatives in candidate_specs:
+            destination = _destination_for_walk(origin, target_distance * distance_factor, bearing)
+            all_routes.extend(
+                await _request_directions(
+                    client=client,
+                    token=token,
+                    origin=origin,
+                    destination=destination,
+                    use_alternatives=use_alternatives,
+                )
+            )
+
+            if len(all_routes) >= 7:
+                break
+
+    deduped = [route for route in _dedupe_routes(all_routes) if _is_valid_route(route)]
+    ranked = sorted(
+        deduped,
+        key=lambda route: _route_accuracy_score(route, target_distance, target_duration_seconds),
+        reverse=True,
+    )[:3]
+
+    for index, route in enumerate(ranked, start=1):
+        route["id"] = f"route_{index}"
+
+    return ranked

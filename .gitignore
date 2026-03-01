@@ -1,0 +1,6 @@
+/skills-lock.json
+/.agents/
+/backend/.env
+/backend/.env.*
+/.env
+/.env.*

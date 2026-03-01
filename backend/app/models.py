@@ -15,6 +15,9 @@ class Preferences(BaseModel):
     water: float = Field(ge=0, le=1)
     historic: float = Field(ge=0, le=1)
     quiet: float = Field(ge=0, le=1)
+    viewpoints: float = Field(ge=0, le=1)
+    culture: float = Field(ge=0, le=1)
+    cafes: float = Field(ge=0, le=1)
 
 
 class Constraints(BaseModel):
@@ -33,6 +36,10 @@ class RouteGenerateRequest(BaseModel):
 class RouteRefineRequest(BaseModel):
     sessionId: str = Field(min_length=3)
     message: str = Field(min_length=2, max_length=500)
+    origin: Location | None = None
+    durationMinutes: int | None = Field(default=None, ge=10, le=180)
+    preferences: Preferences | None = None
+    constraints: Constraints = Field(default_factory=Constraints)
 
 
 class ScoreBreakdown(BaseModel):
@@ -40,6 +47,22 @@ class ScoreBreakdown(BaseModel):
     water: float = Field(ge=0, le=1)
     historic: float = Field(ge=0, le=1)
     quiet: float = Field(ge=0, le=1)
+    viewpoints: float = Field(ge=0, le=1)
+    culture: float = Field(ge=0, le=1)
+    cafes: float = Field(ge=0, le=1)
+
+
+class ScoreDebug(BaseModel):
+    contextAvailable: bool
+    natureFeatureCount: int = Field(ge=0)
+    waterFeatureCount: int = Field(ge=0)
+    historicFeatureCount: int = Field(ge=0)
+    busyRoadFeatureCount: int = Field(ge=0)
+    viewpointFeatureCount: int = Field(ge=0)
+    cultureFeatureCount: int = Field(ge=0)
+    cafeFeatureCount: int = Field(ge=0)
+    quietFromSpeed: float = Field(ge=0, le=1)
+    quietFromRoads: float = Field(ge=0, le=1)
 
 
 class Geometry(BaseModel):
@@ -56,6 +79,7 @@ class RouteResult(BaseModel):
     durationSeconds: int
     scenicScore: float = Field(ge=0, le=100)
     scoreBreakdown: ScoreBreakdown
+    scoreDebug: ScoreDebug | None = None
 
 
 class Explanation(BaseModel):
@@ -64,14 +88,25 @@ class Explanation(BaseModel):
 
 
 class AppliedWeights(BaseModel):
-    nature: float = Field(ge=0.05, le=0.7)
-    water: float = Field(ge=0.05, le=0.7)
-    historic: float = Field(ge=0.05, le=0.7)
-    quiet: float = Field(ge=0.05, le=0.7)
+    nature: float = Field(ge=0.0, le=1.0)
+    water: float = Field(ge=0.0, le=1.0)
+    historic: float = Field(ge=0.0, le=1.0)
+    quiet: float = Field(ge=0.0, le=1.0)
+    viewpoints: float = Field(ge=0.0, le=1.0)
+    culture: float = Field(ge=0.0, le=1.0)
+    cafes: float = Field(ge=0.0, le=1.0)
 
     @model_validator(mode="after")
     def validate_sum(self) -> "AppliedWeights":
-        total = self.nature + self.water + self.historic + self.quiet
+        total = (
+            self.nature
+            + self.water
+            + self.historic
+            + self.quiet
+            + self.viewpoints
+            + self.culture
+            + self.cafes
+        )
         if abs(total - 1.0) > 0.001:
             raise ValueError("weights must sum to 1")
         return self
