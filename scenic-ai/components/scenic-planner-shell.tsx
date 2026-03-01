@@ -45,6 +45,7 @@ type TagObjectMatch = {
 
 type ScoreDebugData = {
   contextAvailable: boolean;
+  poiContextFetchFailed?: boolean;
   natureFeatureCount: number;
   waterFeatureCount: number;
   historicFeatureCount: number;
@@ -73,6 +74,7 @@ type GeoOrigin = {
 };
 
 const STORAGE_KEY = "scenicai.session";
+const ORIGIN_STORAGE_KEY = "scenicai.origin";
 
 const defaultPreferences: Preferences = {
   nature: true,
@@ -177,6 +179,31 @@ export function ScenicPlannerShell() {
     };
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   }, [durationMinutes, isStorageReady, preferences, refineText]);
+
+  useEffect(() => {
+    const raw = window.localStorage.getItem(ORIGIN_STORAGE_KEY);
+    if (!raw) {
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(raw) as { lat?: string; lng?: string };
+      setOriginLat(typeof parsed.lat === "string" ? parsed.lat : "");
+      setOriginLng(typeof parsed.lng === "string" ? parsed.lng : "");
+    } catch {
+      window.localStorage.removeItem(ORIGIN_STORAGE_KEY);
+    }
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(
+      ORIGIN_STORAGE_KEY,
+      JSON.stringify({
+        lat: originLat,
+        lng: originLng,
+      }),
+    );
+  }, [originLat, originLng]);
 
   const selectedPreferences = useMemo(
     () => Object.entries(preferences).filter(([, enabled]) => enabled).map(([key]) => key),
@@ -340,6 +367,7 @@ export function ScenicPlannerShell() {
   };
 
   const debugMatches = selectedRouteDebug?.tagObjectMatches?.[activeDebugTag] ?? [];
+  const poiContextFetchFailed = selectedRouteDebug?.poiContextFetchFailed === true;
 
   const togglePreference = (key: PreferenceKey) => {
     setSessionState((prev) => ({
@@ -532,9 +560,7 @@ export function ScenicPlannerShell() {
           style={{ width: `${sidebarWidth}px` }}
         >
           <div className="flex items-center gap-2">
-            <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-app-foreground text-xs font-semibold text-panel">
-              S
-            </div>
+            <img src="/favicon.ico" alt="ScenicAI" className="h-9 w-9 rounded-xl" />
             <span className="text-lg font-medium">ScenicAI</span>
           </div>
 
@@ -686,9 +712,16 @@ export function ScenicPlannerShell() {
                       );
                     })
                   ) : (
-                    <p className="text-xs text-app-muted">
-                      No matched objects found for {debugTagLabels[activeDebugTag].toLowerCase()} on this route.
-                    </p>
+                    <div className="space-y-1">
+                      <p className="text-xs text-app-muted">
+                        No matched objects found for {debugTagLabels[activeDebugTag].toLowerCase()} on this route.
+                      </p>
+                      {poiContextFetchFailed ? (
+                        <p className="text-xs text-amber-700">
+                          Nearby POI lookup was unavailable for this request, so tag debug may be incomplete.
+                        </p>
+                      ) : null}
+                    </div>
                   )}
                 </div>
               </div>

@@ -1,8 +1,31 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+This is the ScenicAI frontend built with Next.js.
 
 ## Getting Started
 
-First, run the development server:
+The app expects the backend on `http://127.0.0.1:8000` by default.
+
+1. Start backend from `../backend`:
+
+```bash
+uvicorn app.main:app --reload --port 8000
+```
+
+2. Start frontend in this folder:
+
+```bash
+npm install
+npm run dev
+```
+
+3. Open [http://localhost:3000](http://localhost:3000).
+
+## Optional environment override
+
+To point frontend to a non-default backend, set `NEXT_PUBLIC_BACKEND_BASE_URL` in `.env.local`.
+
+## Next.js Notes
+
+Run the development server with:
 
 ```bash
 npm run dev

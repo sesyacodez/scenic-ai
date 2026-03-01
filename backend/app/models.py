@@ -64,6 +64,7 @@ class TagObjectMatch(BaseModel):
 
 class ScoreDebug(BaseModel):
     contextAvailable: bool
+    poiContextFetchFailed: bool = False
     natureFeatureCount: int = Field(ge=0)
     waterFeatureCount: int = Field(ge=0)
     historicFeatureCount: int = Field(ge=0)

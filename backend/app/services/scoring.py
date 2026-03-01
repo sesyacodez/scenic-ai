@@ -241,19 +241,26 @@ def _merge_debug_matches(
 async def _fetch_overpass_route_context(
     client: httpx.AsyncClient,
     route: dict,
-) -> tuple[int, int, int, int, int, int, int, bool, dict[str, list[dict]]]:
+) -> tuple[int, int, int, int, int, int, int, bool, dict[str, list[dict]], bool]:
     points = _sample_route_points(route)
     if not points:
-        return 0, 0, 0, 0, 0, 0, 0, False, _empty_debug_matches()
+        return 0, 0, 0, 0, 0, 0, 0, False, _empty_debug_matches(), False
 
     query = _build_overpass_query(points)
 
-    try:
-        response = await client.post(OVERPASS_INTERPRETER_URL, data={"data": query})
-        response.raise_for_status()
-        payload = response.json()
-    except (httpx.HTTPError, ValueError):
-        return 0, 0, 0, 0, 0, 0, 0, False, _empty_debug_matches()
+    payload: dict | None = None
+    for attempt in range(2):
+        try:
+            response = await client.post(OVERPASS_INTERPRETER_URL, data={"data": query})
+            response.raise_for_status()
+            payload = response.json()
+            break
+        except (httpx.HTTPError, ValueError):
+            if attempt == 1:
+                return 0, 0, 0, 0, 0, 0, 0, False, _empty_debug_matches(), True
+
+    if payload is None:
+        return 0, 0, 0, 0, 0, 0, 0, False, _empty_debug_matches(), True
 
     elements = payload.get("elements", [])
     nature_count = 0
@@ -329,13 +336,14 @@ async def _fetch_overpass_route_context(
         cafe_count,
         True,
         matches_by_tag,
+        False,
     )
 
 
 async def _fetch_route_context(
     client: httpx.AsyncClient,
     route: dict,
-) -> tuple[int, int, int, int, int, int, int, bool, dict[str, list[dict]]]:
+) -> tuple[int, int, int, int, int, int, int, bool, dict[str, list[dict]], bool]:
     edge_features = route.get("edgeFeatures")
     if isinstance(edge_features, dict):
         edge_objects_raw = route.get("edgeFeatureObjects")
@@ -350,6 +358,7 @@ async def _fetch_route_context(
             cafe_count_poi,
             has_poi_context,
             poi_matches,
+            poi_fetch_failed,
         ) = await _fetch_overpass_route_context(client=client, route=route)
         return (
             int(edge_features.get("nature", 0)) + nature_count_poi,
@@ -361,6 +370,7 @@ async def _fetch_route_context(
             int(edge_features.get("cafes", 0)) + cafe_count_poi,
             bool(route.get("graphContextAvailable", True)) or has_poi_context,
             _merge_debug_matches(edge_objects, poi_matches),
+            poi_fetch_failed,
         )
 
     return await _fetch_overpass_route_context(client=client, route=route)
@@ -430,7 +440,7 @@ async def score_routes(routes: list[dict], preferences: Preferences) -> tuple[li
     weights = build_weights(preferences)
     scored_routes: list[dict] = []
 
-    timeout = httpx.Timeout(4.0, connect=2.0)
+    timeout = httpx.Timeout(8.0, connect=3.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         context_tasks = [_fetch_route_context(client=client, route=route) for route in routes]
         route_contexts = await asyncio.gather(*context_tasks)
@@ -446,6 +456,7 @@ async def score_routes(routes: list[dict], preferences: Preferences) -> tuple[li
             cafe_count,
             has_context,
             tag_object_matches,
+            poi_context_fetch_failed,
         ) = context
         breakdown, quiet_from_speed, quiet_from_roads = _breakdown_for_route(
             route,
@@ -466,6 +477,7 @@ async def score_routes(routes: list[dict], preferences: Preferences) -> tuple[li
                 "scoreBreakdown": breakdown,
                 "scoreDebug": ScoreDebug(
                     contextAvailable=has_context,
+                    poiContextFetchFailed=poi_context_fetch_failed,
                     natureFeatureCount=nature_count,
                     waterFeatureCount=water_count,
                     historicFeatureCount=historic_count,
