@@ -11,9 +11,9 @@ The system combines:
 
 Geolocation data
 
-Mapping/routing APIs
+OpenStreetMap graph data
 
-Scenic heuristic scoring
+Graph-weighted scenic scoring
 
 An AI agent built using LangChain + LangGraph
 
@@ -145,9 +145,9 @@ Fallback: manual location input
 
 The system must:
 
-Generate 3–5 alternative walking routes
+Generate 3 alternative walking routes
 
-Use a mapping API (e.g., Mapbox or OpenStreetMap data)
+Build a weighted street graph and run Graph-Weighted A* Pathfinding
 
 Retrieve route geometry (GeoJSON)
 
@@ -163,7 +163,7 @@ Proximity to water bodies
 
 Landmark density
 
-Road type (avoid highways)
+Road type (avoid highways via hard edge exclusion)
 
 Elevation variation (optional)
 
@@ -201,7 +201,9 @@ Intent Parsing Node (LLM)
 
 Constraint Structuring Node
 
-Route Tool Node
+Graph Construction Node
+
+Route Optimization Node
 
 Scenic Scoring Tool
 
@@ -250,7 +252,9 @@ LangChain
 
 LangGraph
 
-Routing API (Mapbox / OpenStreetMap-based service)
+Primary Routing Engine (OpenStreetMap graph traversal)
+
+Fallback Routing Engine (Mapbox probe mode)
 
 Data Flow
 User → Frontend
@@ -259,7 +263,7 @@ Backend API
         ↓
 LangGraph Agent
         ↓
-Route Tool → Scenic Scoring
+Graph Construction → Route Optimization → Scenic Scoring
         ↓
 Selected Route + Explanation
         ↓
@@ -269,7 +273,7 @@ Risk	            Mitigation
 Geo API complexity	Build deterministic version first
 LLM hallucination	Use structured outputs only
 Overengineering	Keep demo scope tight
-Slow routing API	Limit alternate routes
+Graph extraction cost	Bound graph radius and keep fallback mode
 11. MVP Definition
 
 The MVP is complete when:
@@ -293,6 +297,8 @@ Basic conversational refinement works
 Agent correctly adjusts route weights
 
 Scenic route differs meaningfully from fastest route
+
+Route success meets graph connectivity coverage threshold (connected origin/destination graph reachability)
 
 LLM output matches schema
 

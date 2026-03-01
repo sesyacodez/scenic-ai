@@ -26,10 +26,35 @@ type GeneratedRoute = {
   distanceMeters: number;
   durationSeconds: number;
   scenicScore: number;
+  scoreDebug?: ScoreDebugData;
   geometry: {
     type: "LineString";
     coordinates: number[][];
   };
+};
+
+type TagObjectMatch = {
+  objectId: string;
+  objectType: string;
+  name?: string | null;
+  lat?: number | null;
+  lng?: number | null;
+  matchedBy: string[];
+  tags: Record<string, string>;
+};
+
+type ScoreDebugData = {
+  contextAvailable: boolean;
+  natureFeatureCount: number;
+  waterFeatureCount: number;
+  historicFeatureCount: number;
+  busyRoadFeatureCount: number;
+  viewpointFeatureCount: number;
+  cultureFeatureCount: number;
+  cafeFeatureCount: number;
+  quietFromSpeed: number;
+  quietFromRoads: number;
+  tagObjectMatches?: Partial<Record<PreferenceKey | "busyRoad", TagObjectMatch[]>>;
 };
 
 type GenerateResponse = {
@@ -101,6 +126,8 @@ export function ScenicPlannerShell() {
   const [explanationText, setExplanationText] = useState(
     "Generate a route to see AI reasoning grounded in scored alternatives.",
   );
+  const [selectedRouteDebug, setSelectedRouteDebug] = useState<ScoreDebugData | null>(null);
+  const [activeDebugTag, setActiveDebugTag] = useState<PreferenceKey>("nature");
   const [selectedRouteCoordinates, setSelectedRouteCoordinates] = useState<number[][] | null>(null);
   const [mapCenter, setMapCenter] = useState<[number, number]>([-0.1278, 51.5074]);
 
@@ -281,6 +308,11 @@ export function ScenicPlannerShell() {
     cafes: "Cafes",
   };
 
+  const debugTagLabels: Record<PreferenceKey | "busyRoad", string> = {
+    ...preferenceLabels,
+    busyRoad: "Busy Roads",
+  };
+
   const applyRouteResponse = (
     payload: GenerateResponse,
     origin: { lat: number; lng: number },
@@ -289,6 +321,7 @@ export function ScenicPlannerShell() {
     if (payload.routes.length === 0 || payload.selectedRouteId === null) {
       setExplanationText(payload.explanation.summary);
       setRequestError(fallbackNoRouteMessage);
+      setSelectedRouteDebug(null);
       return;
     }
 
@@ -300,9 +333,13 @@ export function ScenicPlannerShell() {
     setRouteMeta(`${distanceKm} km ・ ${minutes} min walk`);
     setScenicScore(selected.scenicScore);
     setExplanationText(payload.explanation.summary);
+    setSelectedRouteDebug(selected.scoreDebug ?? null);
+    setActiveDebugTag(preferenceButtonOrder.find((key) => preferences[key]) ?? "nature");
     setSelectedRouteCoordinates(selected.geometry.coordinates);
     setMapCenter([origin.lng, origin.lat]);
   };
+
+  const debugMatches = selectedRouteDebug?.tagObjectMatches?.[activeDebugTag] ?? [];
 
   const togglePreference = (key: PreferenceKey) => {
     setSessionState((prev) => ({
@@ -608,6 +645,52 @@ export function ScenicPlannerShell() {
               </div>
               <div className="rounded-xl border border-panel-border bg-white p-3 text-sm text-app-muted">
                 {explanationText} Preferences: {selectedPreferences.join(", ") || "balanced"}.
+              </div>
+
+              <div className="rounded-xl border border-panel-border bg-white p-3">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs font-semibold uppercase tracking-wider text-app-muted">Tag Debug</p>
+                  <select
+                    value={activeDebugTag}
+                    onChange={(event) => setActiveDebugTag(event.target.value as PreferenceKey)}
+                    className="h-7 rounded-md border border-panel-border bg-white px-2 text-xs"
+                  >
+                    {preferenceButtonOrder.map((key) => (
+                      <option key={key} value={key}>
+                        {debugTagLabels[key]}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="mt-2 max-h-40 space-y-2 overflow-auto pr-1">
+                  {debugMatches.length > 0 ? (
+                    debugMatches.map((match) => {
+                      const objectTitle = match.name?.trim() || match.objectId;
+                      const tagSummary = Object.entries(match.tags)
+                        .filter(([key]) => key !== "name")
+                        .slice(0, 3)
+                        .map(([key, value]) => `${key}=${value}`)
+                        .join(", ");
+
+                      return (
+                        <div key={match.objectId} className="rounded-lg border border-panel-border p-2 text-xs text-app-muted">
+                          <p className="font-medium text-app-foreground">{objectTitle}</p>
+                          <p>{tagSummary || "Tagged scenic feature"}</p>
+                          {typeof match.lat === "number" && typeof match.lng === "number" ? (
+                            <p>
+                              {match.lat.toFixed(5)}, {match.lng.toFixed(5)}
+                            </p>
+                          ) : null}
+                        </div>
+                      );
+                    })
+                  ) : (
+                    <p className="text-xs text-app-muted">
+                      No matched objects found for {debugTagLabels[activeDebugTag].toLowerCase()} on this route.
+                    </p>
+                  )}
+                </div>
               </div>
             </section>
 

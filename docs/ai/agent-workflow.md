@@ -10,19 +10,23 @@
    - Input: parsed intent + defaults
    - Output: canonical constraints object
 
-3. `route_tool`
+3. `graph_construction`
    - Input: origin + target duration + constraints
-   - Output: 3 candidate routes from Mapbox
+   - Output: weighted street graph + edge feature map
 
-4. `scenic_score_tool`
-   - Input: candidate routes + preference weights
+4. `route_optimization`
+   - Input: weighted graph + planner weighting parameters
+   - Output: 3 candidate graph paths (Mapbox probe fallback if graph build fails)
+
+5. `scenic_score_tool`
+   - Input: graph paths + edge-level scenic features + preference weights
    - Output: scored route list with component scores
 
-5. `route_rank`
+6. `route_rank`
    - Input: scored routes
    - Output: selected route id + ordered list
 
-6. `explanation_gen`
+7. `explanation_gen`
    - Input: selected route + score breakdown + constraints
    - Output: short transparent explanation
 
@@ -45,8 +49,9 @@
 
 - Every node must write typed outputs to state
 - Any node validation failure routes to `error_exit`
-- If route tool returns <3 routes, workflow retries once with relaxed constraints
-- If still <3 routes, return `status=no_route` safely
+- Planner manages graph-weighting parameters (`k`, avoid-busy hard exclusion)
+- If graph construction/pathfinding fails, workflow falls back to Mapbox probe mode
+- If fallback returns <3 routes, workflow uses deterministic mock fallback
 
 ## Determinism Policy
 

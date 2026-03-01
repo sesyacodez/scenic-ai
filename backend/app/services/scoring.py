@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+from collections import defaultdict
 
 import httpx
 
-from app.models import AppliedWeights, Preferences, ScoreBreakdown, ScoreDebug
+from app.models import AppliedWeights, Preferences, ScoreBreakdown, ScoreDebug, TagObjectMatch
 
 
 OVERPASS_INTERPRETER_URL = os.getenv(
@@ -57,6 +58,16 @@ BUSY_HIGHWAY_TAGS = {
     "tertiary",
     "tertiary_link",
 }
+
+DEBUG_TAG_KEYS = (
+    "nature",
+    "water",
+    "historic",
+    "busyRoad",
+    "viewpoints",
+    "culture",
+    "cafes",
+)
 
 
 def build_weights(preferences: Preferences) -> AppliedWeights:
@@ -114,8 +125,86 @@ def _build_overpass_query(points: list[tuple[float, float]], radius_meters: int 
 (
     {points_block}
 );
-out tags;
+out center tags;
 """.strip()
+
+
+def _empty_debug_matches() -> dict[str, list[dict]]:
+    return {key: [] for key in DEBUG_TAG_KEYS}
+
+
+def _stringify_tag_value(value: object) -> str:
+    if isinstance(value, list):
+        return str(value[0]) if value else ""
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _extract_debug_tags(tags: dict) -> dict[str, str]:
+    debug_keys = (
+        "name",
+        "natural",
+        "leisure",
+        "landuse",
+        "waterway",
+        "highway",
+        "historic",
+        "tourism",
+        "amenity",
+        "sport",
+        "water",
+    )
+    extracted: dict[str, str] = {}
+    for key in debug_keys:
+        value = _stringify_tag_value(tags.get(key))
+        if value:
+            extracted[key] = value
+    return extracted
+
+
+def _element_to_debug_object(element: dict, tags: dict, matched_by: set[str]) -> dict:
+    object_type = str(element.get("type") or "unknown")
+    object_id = str(element.get("id") or "unknown")
+    lat = element.get("lat")
+    lng = element.get("lon")
+
+    if (lat is None or lng is None) and isinstance(element.get("center"), dict):
+        center = element["center"]
+        lat = center.get("lat")
+        lng = center.get("lon")
+
+    tag_values = _extract_debug_tags(tags)
+    return {
+        "objectId": f"{object_type}:{object_id}",
+        "objectType": object_type,
+        "name": tag_values.get("name"),
+        "lat": float(lat) if lat is not None else None,
+        "lng": float(lng) if lng is not None else None,
+        "matchedBy": sorted(matched_by),
+        "tags": tag_values,
+    }
+
+
+def _attach_debug_match(
+    matches_by_tag: dict[str, list[dict]],
+    seen_by_tag: dict[str, set[str]],
+    debug_object: dict,
+    matched_tag: str,
+    max_items_per_tag: int = 25,
+) -> None:
+    if matched_tag not in matches_by_tag:
+        return
+
+    object_signature = str(debug_object.get("objectId") or "unknown")
+    if object_signature in seen_by_tag[matched_tag]:
+        return
+
+    if len(matches_by_tag[matched_tag]) >= max_items_per_tag:
+        return
+
+    seen_by_tag[matched_tag].add(object_signature)
+    matches_by_tag[matched_tag].append(debug_object)
 
 
 def _is_sports_related(tags: dict) -> bool:
@@ -124,13 +213,38 @@ def _is_sports_related(tags: dict) -> bool:
     return leisure in SPORT_LEISURE_TAGS or amenity in SPORT_AMENITY_TAGS or bool(tags.get("sport"))
 
 
-async def _fetch_route_context(
+def _merge_debug_matches(
+    primary: dict[str, list[dict]],
+    secondary: dict[str, list[dict]],
+    max_items_per_tag: int = 25,
+) -> dict[str, list[dict]]:
+    merged = _empty_debug_matches()
+    for tag in DEBUG_TAG_KEYS:
+        seen: set[str] = set()
+        for item in primary.get(tag, []):
+            signature = str(item.get("objectId") or "unknown")
+            if signature in seen:
+                continue
+            seen.add(signature)
+            if len(merged[tag]) < max_items_per_tag:
+                merged[tag].append(item)
+        for item in secondary.get(tag, []):
+            signature = str(item.get("objectId") or "unknown")
+            if signature in seen:
+                continue
+            seen.add(signature)
+            if len(merged[tag]) < max_items_per_tag:
+                merged[tag].append(item)
+    return merged
+
+
+async def _fetch_overpass_route_context(
     client: httpx.AsyncClient,
     route: dict,
-) -> tuple[int, int, int, int, int, int, int, bool]:
+) -> tuple[int, int, int, int, int, int, int, bool, dict[str, list[dict]]]:
     points = _sample_route_points(route)
     if not points:
-        return 0, 0, 0, 0, 0, 0, 0, False
+        return 0, 0, 0, 0, 0, 0, 0, False, _empty_debug_matches()
 
     query = _build_overpass_query(points)
 
@@ -139,7 +253,7 @@ async def _fetch_route_context(
         response.raise_for_status()
         payload = response.json()
     except (httpx.HTTPError, ValueError):
-        return 0, 0, 0, 0, 0, 0, 0, False
+        return 0, 0, 0, 0, 0, 0, 0, False, _empty_debug_matches()
 
     elements = payload.get("elements", [])
     nature_count = 0
@@ -149,6 +263,8 @@ async def _fetch_route_context(
     viewpoint_count = 0
     culture_count = 0
     cafe_count = 0
+    matches_by_tag = _empty_debug_matches()
+    seen_by_tag: dict[str, set[str]] = defaultdict(set)
 
     for element in elements:
         tags = element.get("tags")
@@ -163,21 +279,27 @@ async def _fetch_route_context(
         historic = tags.get("historic")
         tourism = tags.get("tourism")
         amenity = tags.get("amenity")
+        matched_by: set[str] = set()
 
         if historic:
             historic_count += 1
+            matched_by.add("historic")
 
         if natural in NATURE_NATURAL_TAGS or leisure in NATURE_LEISURE_TAGS or landuse in NATURE_LANDUSE_TAGS:
             nature_count += 1
+            matched_by.add("nature")
 
         if natural in WATER_NATURAL_TAGS or waterway or landuse in WATER_LANDUSE_TAGS or tags.get("water"):
             water_count += 1
+            matched_by.add("water")
 
         if highway in BUSY_HIGHWAY_TAGS:
             busy_road_count += 1
+            matched_by.add("busyRoad")
 
         if tourism in VIEWPOINT_TOURISM_TAGS:
             viewpoint_count += 1
+            matched_by.add("viewpoints")
 
         is_culture_feature = (
             tourism in CULTURE_TOURISM_TAGS
@@ -186,11 +308,62 @@ async def _fetch_route_context(
         )
         if is_culture_feature and not _is_sports_related(tags):
             culture_count += 1
+            matched_by.add("culture")
 
         if amenity in CAFE_AMENITY_TAGS:
             cafe_count += 1
+            matched_by.add("cafes")
 
-    return nature_count, water_count, historic_count, busy_road_count, viewpoint_count, culture_count, cafe_count, True
+        if matched_by:
+            debug_object = _element_to_debug_object(element=element, tags=tags, matched_by=matched_by)
+            for matched_tag in matched_by:
+                _attach_debug_match(matches_by_tag, seen_by_tag, debug_object, matched_tag)
+
+    return (
+        nature_count,
+        water_count,
+        historic_count,
+        busy_road_count,
+        viewpoint_count,
+        culture_count,
+        cafe_count,
+        True,
+        matches_by_tag,
+    )
+
+
+async def _fetch_route_context(
+    client: httpx.AsyncClient,
+    route: dict,
+) -> tuple[int, int, int, int, int, int, int, bool, dict[str, list[dict]]]:
+    edge_features = route.get("edgeFeatures")
+    if isinstance(edge_features, dict):
+        edge_objects_raw = route.get("edgeFeatureObjects")
+        edge_objects = edge_objects_raw if isinstance(edge_objects_raw, dict) else _empty_debug_matches()
+        (
+            nature_count_poi,
+            water_count_poi,
+            historic_count_poi,
+            busy_road_count_poi,
+            viewpoint_count_poi,
+            culture_count_poi,
+            cafe_count_poi,
+            has_poi_context,
+            poi_matches,
+        ) = await _fetch_overpass_route_context(client=client, route=route)
+        return (
+            int(edge_features.get("nature", 0)) + nature_count_poi,
+            int(edge_features.get("water", 0)) + water_count_poi,
+            int(edge_features.get("historic", 0)) + historic_count_poi,
+            int(edge_features.get("busyRoad", 0)) + busy_road_count_poi,
+            int(edge_features.get("viewpoints", 0)) + viewpoint_count_poi,
+            int(edge_features.get("culture", 0)) + culture_count_poi,
+            int(edge_features.get("cafes", 0)) + cafe_count_poi,
+            bool(route.get("graphContextAvailable", True)) or has_poi_context,
+            _merge_debug_matches(edge_objects, poi_matches),
+        )
+
+    return await _fetch_overpass_route_context(client=client, route=route)
 
 
 def _breakdown_for_route(
@@ -263,7 +436,17 @@ async def score_routes(routes: list[dict], preferences: Preferences) -> tuple[li
         route_contexts = await asyncio.gather(*context_tasks)
 
     for route, context in zip(routes, route_contexts):
-        nature_count, water_count, historic_count, busy_road_count, viewpoint_count, culture_count, cafe_count, has_context = context
+        (
+            nature_count,
+            water_count,
+            historic_count,
+            busy_road_count,
+            viewpoint_count,
+            culture_count,
+            cafe_count,
+            has_context,
+            tag_object_matches,
+        ) = context
         breakdown, quiet_from_speed, quiet_from_roads = _breakdown_for_route(
             route,
             nature_count=nature_count,
@@ -292,6 +475,10 @@ async def score_routes(routes: list[dict], preferences: Preferences) -> tuple[li
                     cafeFeatureCount=cafe_count,
                     quietFromSpeed=quiet_from_speed,
                     quietFromRoads=quiet_from_roads,
+                    tagObjectMatches={
+                        key: [TagObjectMatch(**item) for item in items]
+                        for key, items in tag_object_matches.items()
+                    },
                 ),
             }
         )

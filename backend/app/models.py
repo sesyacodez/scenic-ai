@@ -52,6 +52,16 @@ class ScoreBreakdown(BaseModel):
     cafes: float = Field(ge=0, le=1)
 
 
+class TagObjectMatch(BaseModel):
+    objectId: str
+    objectType: str
+    name: str | None = None
+    lat: float | None = None
+    lng: float | None = None
+    matchedBy: list[str] = Field(default_factory=list)
+    tags: dict[str, str] = Field(default_factory=dict)
+
+
 class ScoreDebug(BaseModel):
     contextAvailable: bool
     natureFeatureCount: int = Field(ge=0)
@@ -63,6 +73,7 @@ class ScoreDebug(BaseModel):
     cafeFeatureCount: int = Field(ge=0)
     quietFromSpeed: float = Field(ge=0, le=1)
     quietFromRoads: float = Field(ge=0, le=1)
+    tagObjectMatches: dict[str, list[TagObjectMatch]] = Field(default_factory=dict)
 
 
 class Geometry(BaseModel):

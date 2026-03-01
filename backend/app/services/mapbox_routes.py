@@ -110,7 +110,7 @@ def _route_accuracy_score(route: dict, target_distance: float, target_duration_s
     return 0.48 * distance_component + 0.47 * duration_component + 0.05 * shape_detail
 
 
-async def build_mapbox_routes(
+async def build_mapbox_probe_routes(
     origin: Location,
     duration_minutes: int,
     constraints: Constraints,
@@ -167,3 +167,33 @@ async def build_mapbox_routes(
         route["id"] = f"route_{index}"
 
     return ranked
+
+
+def _post_process_routes(routes: list[dict]) -> list[dict]:
+    for index, route in enumerate(routes, start=1):
+        route["id"] = f"route_{index}"
+    return routes
+
+
+async def build_mapbox_routes(
+    origin: Location,
+    duration_minutes: int,
+    constraints: Constraints,
+) -> list[dict]:
+    try:
+        from app.core.graph_routing import build_graph_routes
+    except Exception:
+        return []
+
+    scenic_k = float(os.getenv("GRAPH_SCENIC_K", "1.0"))
+    try:
+        graph_routes = build_graph_routes(
+            origin=origin,
+            duration_minutes=duration_minutes,
+            constraints=constraints,
+            scenic_k=scenic_k,
+        )
+    except Exception:
+        return []
+
+    return _post_process_routes(graph_routes)

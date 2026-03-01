@@ -16,7 +16,7 @@ from app.models import (
     RouteRefineRequest,
     RouteResult,
 )
-from app.services.mapbox_routes import build_mapbox_routes
+from app.services.mapbox_routes import build_mapbox_probe_routes, build_mapbox_routes
 from app.services.mock_routes import build_mock_routes
 from app.services.scoring import score_routes
 
@@ -136,9 +136,18 @@ async def _plan_routes(
         constraints=constraints,
     )
 
-    used_fallback = False
+    used_probe_fallback = False
+    used_mock_fallback = False
     if len(candidates) < 3:
-        used_fallback = True
+        used_probe_fallback = True
+        candidates = await build_mapbox_probe_routes(
+            origin=origin,
+            duration_minutes=duration_minutes,
+            constraints=constraints,
+        )
+
+    if len(candidates) < 3:
+        used_mock_fallback = True
         candidates = build_mock_routes(origin)
 
     ranked, weights = await score_routes(candidates, preferences)
@@ -152,8 +161,10 @@ async def _plan_routes(
     ]
     if constraints.avoidBusyRoads:
         reasons.append("Applied busy-road avoidance preference")
-    if used_fallback:
-        reasons.append("Used deterministic fallback routes due to provider availability")
+    if used_probe_fallback:
+        reasons.append("Used legacy probe routing fallback after graph construction failure")
+    if used_mock_fallback:
+        reasons.append("Used deterministic mock fallback due to route provider availability")
     if extra_reasons:
         reasons = extra_reasons + reasons
 
