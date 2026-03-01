@@ -1,0 +1,33 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f7f8f3;
+  --foreground: #1f2933;
+  --panel: #ffffff;
+  --panel-border: #d9dfd2;
+  --muted: #5f6c72;
+  --accent: #4e8a6d;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-app: var(--background);
+  --color-app-foreground: var(--foreground);
+  --color-app-muted: var(--muted);
+  --color-panel: var(--panel);
+  --color-panel-border: var(--panel-border);
+  --color-accent: var(--accent);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
+}
+
+.scenic-gradient {
+  background: linear-gradient(130deg, #e6f0e6 0%, #e2edf5 55%, #f2ead6 100%);
+}
