@@ -43,6 +43,11 @@ type TagObjectMatch = {
   tags: Record<string, string>;
 };
 
+type DebugHoverTarget = {
+  coordinates: [number, number];
+  name: string;
+};
+
 type ScoreDebugData = {
   contextAvailable: boolean;
   poiContextFetchFailed?: boolean;
@@ -65,6 +70,11 @@ type GenerateResponse = {
     summary: string;
     reasons: string[];
   };
+};
+
+type BackendErrorPayload = {
+  detail?: unknown;
+  message?: unknown;
 };
 
 type GeoOrigin = {
@@ -118,6 +128,7 @@ const DEFAULT_SIDEBAR_WIDTH = 308;
 const MAX_ACCEPTABLE_ACCURACY_METERS = 250;
 const ORIGIN_SEARCH_DEBOUNCE_MS = 220;
 const MAX_WAYPOINTS = 3;
+const DEBUG_HOVER_CLEAR_DELAY_MS = 1000;
 
 const resolveBackendBaseUrl = () => {
   if (process.env.NEXT_PUBLIC_BACKEND_BASE_URL) {
@@ -130,6 +141,37 @@ const resolveBackendBaseUrl = () => {
   }
 
   return "http://127.0.0.1:8000";
+};
+
+const extractBackendErrorDetail = async (response: Response): Promise<string | null> => {
+  try {
+    const payload = (await response.json()) as BackendErrorPayload;
+
+    if (typeof payload.detail === "string") {
+      return payload.detail;
+    }
+
+    if (Array.isArray(payload.detail) && payload.detail.length > 0) {
+      const first = payload.detail[0];
+      if (typeof first === "string") {
+        return first;
+      }
+      if (first && typeof first === "object") {
+        const maybeMessage = (first as { msg?: unknown }).msg;
+        if (typeof maybeMessage === "string") {
+          return maybeMessage;
+        }
+      }
+    }
+
+    if (typeof payload.message === "string") {
+      return payload.message;
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
 };
 
 export function ScenicPlannerShell() {
@@ -180,6 +222,8 @@ export function ScenicPlannerShell() {
   );
   const [selectedRouteDebug, setSelectedRouteDebug] = useState<ScoreDebugData | null>(null);
   const [activeDebugTag, setActiveDebugTag] = useState<PreferenceKey>("nature");
+  const [hoveredDebugTarget, setHoveredDebugTarget] = useState<DebugHoverTarget | null>(null);
+  const debugHoverClearTimeoutRef = useRef<number | null>(null);
   const [selectedRouteCoordinates, setSelectedRouteCoordinates] = useState<number[][] | null>(null);
   const [mapCenter, setMapCenter] = useState<[number, number]>([-0.1278, 51.5074]);
 
@@ -315,6 +359,10 @@ export function ScenicPlannerShell() {
         window.clearTimeout(waypointSearchDebounceRef.current);
       }
       waypointSearchAbortRef.current?.abort();
+      if (debugHoverClearTimeoutRef.current !== null) {
+        window.clearTimeout(debugHoverClearTimeoutRef.current);
+        debugHoverClearTimeoutRef.current = null;
+      }
     };
   }, []);
 
@@ -341,7 +389,8 @@ export function ScenicPlannerShell() {
         });
 
         if (!response.ok) {
-          throw new Error(`Location search failed (${response.status})`);
+          const detail = await extractBackendErrorDetail(response);
+          throw new Error(detail || `Location search failed (${response.status})`);
         }
 
         const payload = (await response.json()) as { results?: PlaceSuggestion[] };
@@ -355,7 +404,11 @@ export function ScenicPlannerShell() {
         }
         setOriginSuggestions([]);
         setActiveOriginSuggestionIndex(-1);
-        setOriginSearchError("Location search unavailable. You can still enter coordinates below.");
+        setOriginSearchError(
+          error instanceof Error
+            ? error.message
+            : "Location search unavailable. You can still enter coordinates below.",
+        );
       } finally {
         setIsOriginSearchLoading(false);
       }
@@ -386,7 +439,8 @@ export function ScenicPlannerShell() {
         });
 
         if (!response.ok) {
-          throw new Error(`Location search failed (${response.status})`);
+          const detail = await extractBackendErrorDetail(response);
+          throw new Error(detail || `Location search failed (${response.status})`);
         }
 
         const payload = (await response.json()) as { results?: PlaceSuggestion[] };
@@ -400,7 +454,9 @@ export function ScenicPlannerShell() {
         }
         setDestinationSuggestions([]);
         setActiveDestinationSuggestionIndex(-1);
-        setDestinationSearchError("Destination search unavailable right now.");
+        setDestinationSearchError(
+          error instanceof Error ? error.message : "Destination search unavailable right now.",
+        );
       } finally {
         setIsDestinationSearchLoading(false);
       }
@@ -431,7 +487,8 @@ export function ScenicPlannerShell() {
         });
 
         if (!response.ok) {
-          throw new Error(`Location search failed (${response.status})`);
+          const detail = await extractBackendErrorDetail(response);
+          throw new Error(detail || `Location search failed (${response.status})`);
         }
 
         const payload = (await response.json()) as { results?: PlaceSuggestion[] };
@@ -445,7 +502,7 @@ export function ScenicPlannerShell() {
         }
         setWaypointSuggestions([]);
         setActiveWaypointSuggestionIndex(-1);
-        setWaypointSearchError("Waypoint search unavailable right now.");
+        setWaypointSearchError(error instanceof Error ? error.message : "Waypoint search unavailable right now.");
       } finally {
         setIsWaypointSearchLoading(false);
       }
@@ -463,6 +520,10 @@ export function ScenicPlannerShell() {
         });
 
         if (!response.ok) {
+          const detail = await extractBackendErrorDetail(response);
+          if (detail) {
+            setLocationNote(detail);
+          }
           return;
         }
 
@@ -720,6 +781,11 @@ export function ScenicPlannerShell() {
       setExplanationText(payload.explanation.summary);
       setRequestError(fallbackNoRouteMessage);
       setSelectedRouteDebug(null);
+      if (debugHoverClearTimeoutRef.current !== null) {
+        window.clearTimeout(debugHoverClearTimeoutRef.current);
+        debugHoverClearTimeoutRef.current = null;
+      }
+      setHoveredDebugTarget(null);
       return;
     }
 
@@ -733,6 +799,11 @@ export function ScenicPlannerShell() {
     setExplanationText(payload.explanation.summary);
     setSelectedRouteDebug(selected.scoreDebug ?? null);
     setActiveDebugTag(preferenceButtonOrder.find((key) => preferences[key]) ?? "nature");
+    if (debugHoverClearTimeoutRef.current !== null) {
+      window.clearTimeout(debugHoverClearTimeoutRef.current);
+      debugHoverClearTimeoutRef.current = null;
+    }
+    setHoveredDebugTarget(null);
     setSelectedRouteCoordinates(selected.geometry.coordinates);
     setMapCenter([origin.lng, origin.lat]);
   };
@@ -1004,7 +1075,14 @@ export function ScenicPlannerShell() {
       });
 
       if (!response.ok) {
-        throw new Error(`Backend returned ${response.status}`);
+        let detail = "";
+        try {
+          const errorPayload = (await response.json()) as BackendErrorPayload;
+          detail = typeof errorPayload.detail === "string" ? errorPayload.detail : "";
+        } catch {
+          detail = "";
+        }
+        throw new Error(detail || `Backend returned ${response.status}`);
       }
 
       const payload = (await response.json()) as GenerateResponse;
@@ -1056,7 +1134,14 @@ export function ScenicPlannerShell() {
       });
 
       if (!response.ok) {
-        throw new Error(`Backend returned ${response.status}`);
+        let detail = "";
+        try {
+          const errorPayload = (await response.json()) as BackendErrorPayload;
+          detail = typeof errorPayload.detail === "string" ? errorPayload.detail : "";
+        } catch {
+          detail = "";
+        }
+        throw new Error(detail || `Backend returned ${response.status}`);
       }
 
       const payload = (await response.json()) as GenerateResponse;
@@ -1495,7 +1580,14 @@ export function ScenicPlannerShell() {
                   <p className="text-xs font-semibold uppercase tracking-wider text-app-muted">Tag Debug</p>
                   <select
                     value={activeDebugTag}
-                    onChange={(event) => setActiveDebugTag(event.target.value as PreferenceKey)}
+                    onChange={(event) => {
+                      setActiveDebugTag(event.target.value as PreferenceKey);
+                      if (debugHoverClearTimeoutRef.current !== null) {
+                        window.clearTimeout(debugHoverClearTimeoutRef.current);
+                        debugHoverClearTimeoutRef.current = null;
+                      }
+                      setHoveredDebugTarget(null);
+                    }}
                     className="h-7 rounded-md border border-panel-border bg-white px-2 text-xs"
                   >
                     {preferenceButtonOrder.map((key) => (
@@ -1517,7 +1609,33 @@ export function ScenicPlannerShell() {
                         .join(", ");
 
                       return (
-                        <div key={match.objectId} className="rounded-lg border border-panel-border p-2 text-xs text-app-muted">
+                        <div
+                          key={match.objectId}
+                          onMouseEnter={() => {
+                            if (debugHoverClearTimeoutRef.current !== null) {
+                              window.clearTimeout(debugHoverClearTimeoutRef.current);
+                              debugHoverClearTimeoutRef.current = null;
+                            }
+                            if (typeof match.lat === "number" && typeof match.lng === "number") {
+                              setHoveredDebugTarget({
+                                coordinates: [match.lng, match.lat],
+                                name: objectTitle,
+                              });
+                              return;
+                            }
+                            setHoveredDebugTarget(null);
+                          }}
+                          onMouseLeave={() => {
+                            if (debugHoverClearTimeoutRef.current !== null) {
+                              window.clearTimeout(debugHoverClearTimeoutRef.current);
+                            }
+                            debugHoverClearTimeoutRef.current = window.setTimeout(() => {
+                              setHoveredDebugTarget(null);
+                              debugHoverClearTimeoutRef.current = null;
+                            }, DEBUG_HOVER_CLEAR_DELAY_MS);
+                          }}
+                          className="rounded-lg border border-panel-border p-2 text-xs text-app-muted transition duration-150 hover:-translate-y-0.5 hover:scale-[1.01] hover:border-accent/40 hover:bg-accent/5"
+                        >
                           <p className="font-medium text-app-foreground">{objectTitle}</p>
                           <p>{tagSummary || "Tagged scenic feature"}</p>
                           {typeof match.lat === "number" && typeof match.lng === "number" ? (
@@ -1584,7 +1702,11 @@ export function ScenicPlannerShell() {
         </div>
 
         <section className="relative h-full flex-1 overflow-hidden bg-panel">
-          <ScenicMap routeCoordinates={selectedRouteCoordinates} fallbackCenter={mapCenter} />
+          <ScenicMap
+            routeCoordinates={selectedRouteCoordinates}
+            fallbackCenter={mapCenter}
+            highlightedLocation={hoveredDebugTarget}
+          />
         </section>
       </div>
     </main>

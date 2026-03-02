@@ -40,6 +40,7 @@ else:
 from app.models import (
     Constraints,
     Explanation,
+    Location,
     LocationSearchRequest,
     LocationSearchResponse,
     Preferences,
@@ -114,6 +115,31 @@ async def location_reverse(payload: ReverseGeocodeRequest) -> LocationSearchResp
 
 def _clamp(value: float, min_value: float, max_value: float) -> float:
     return max(min_value, min(max_value, value))
+
+
+def _is_placeholder_location(location: Location) -> bool:
+    return abs(location.lat) < 1e-9 and abs(location.lng) < 1e-9
+
+
+def _validate_route_points(origin: Location, destination: Location | None, waypoints: list[Location]) -> None:
+    if _is_placeholder_location(origin):
+        raise HTTPException(
+            status_code=422,
+            detail="Origin coordinates are invalid. Please pick a valid origin from suggestions or use current location.",
+        )
+
+    if destination is not None and _is_placeholder_location(destination):
+        raise HTTPException(
+            status_code=422,
+            detail="Destination coordinates are invalid. Please select a destination from suggestions.",
+        )
+
+    for index, waypoint in enumerate(waypoints, start=1):
+        if _is_placeholder_location(waypoint):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Waypoint {index} coordinates are invalid. Please select a valid waypoint from suggestions.",
+            )
 
 
 def _apply_refinement(
@@ -249,6 +275,11 @@ async def _plan_routes(
 @app.post("/api/v1/route/generate", response_model=RouteGenerateResponse)
 async def generate_route(payload: RouteGenerateRequest) -> RouteGenerateResponse:
     request_id = f"req_{uuid4().hex[:10]}"
+    _validate_route_points(
+        origin=payload.origin,
+        destination=payload.destination,
+        waypoints=payload.waypoints,
+    )
     return await _plan_routes(
         request_id=request_id,
         origin=payload.origin,
@@ -284,6 +315,12 @@ async def refine_route(payload: RouteRefineRequest) -> RouteGenerateResponse:
                 "cafes": 0.142,
             },
         )
+
+    _validate_route_points(
+        origin=payload.origin,
+        destination=payload.destination,
+        waypoints=payload.waypoints or [],
+    )
 
     base_duration = payload.durationMinutes if payload.durationMinutes is not None else 45
     base_preferences = (
