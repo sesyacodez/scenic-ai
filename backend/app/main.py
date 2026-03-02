@@ -2,20 +2,54 @@ from __future__ import annotations
 
 import os
 import socket
+from pathlib import Path
 from uuid import uuid4
 
+import httpx
 from fastapi import FastAPI
+from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover
+    load_dotenv = None
+
+
+def _load_env_file(env_path: Path) -> None:
+    if not env_path.exists():
+        return
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        os.environ[key] = value.strip().strip('"').strip("'")
+
+
+env_file = Path(__file__).resolve().parents[1] / ".env"
+if load_dotenv is not None:
+    load_dotenv(env_file)
+else:
+    _load_env_file(env_file)
 
 from app.models import (
     Constraints,
     Explanation,
+    LocationSearchRequest,
+    LocationSearchResponse,
     Preferences,
+    ReverseGeocodeRequest,
     RouteGenerateRequest,
     RouteGenerateResponse,
     RouteRefineRequest,
     RouteResult,
 )
+from app.services.location_search import reverse_geocode, search_locations
 from app.services.mapbox_routes import build_mapbox_probe_routes, build_mapbox_routes
 from app.services.mock_routes import build_mock_routes
 from app.services.scoring import score_routes
@@ -51,6 +85,31 @@ app.add_middleware(
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "service": "scenicai-backend"}
+
+
+@app.post("/api/v1/location/search", response_model=LocationSearchResponse)
+async def location_search(payload: LocationSearchRequest) -> LocationSearchResponse:
+    try:
+        results = await search_locations(
+            query=payload.query,
+            limit=payload.limit,
+            proximity_lat=payload.proximityLat,
+            proximity_lng=payload.proximityLng,
+        )
+    except httpx.HTTPError as error:
+        raise HTTPException(status_code=502, detail=f"Location search provider unavailable: {error}") from error
+
+    return LocationSearchResponse(results=results)
+
+
+@app.post("/api/v1/location/reverse", response_model=LocationSearchResponse)
+async def location_reverse(payload: ReverseGeocodeRequest) -> LocationSearchResponse:
+    try:
+        result = await reverse_geocode(lat=payload.lat, lng=payload.lng)
+    except httpx.HTTPError as error:
+        raise HTTPException(status_code=502, detail=f"Reverse geocoding provider unavailable: {error}") from error
+
+    return LocationSearchResponse(results=[result] if result is not None else [])
 
 
 def _clamp(value: float, min_value: float, max_value: float) -> float:
@@ -125,6 +184,8 @@ def _apply_refinement(
 async def _plan_routes(
     request_id: str,
     origin,
+    destination,
+    waypoints,
     duration_minutes: int,
     preferences: Preferences,
     constraints: Constraints,
@@ -134,6 +195,8 @@ async def _plan_routes(
         origin=origin,
         duration_minutes=duration_minutes,
         constraints=constraints,
+        destination=destination,
+        waypoints=waypoints,
     )
 
     used_probe_fallback = False
@@ -189,6 +252,8 @@ async def generate_route(payload: RouteGenerateRequest) -> RouteGenerateResponse
     return await _plan_routes(
         request_id=request_id,
         origin=payload.origin,
+        destination=payload.destination,
+        waypoints=payload.waypoints,
         duration_minutes=payload.durationMinutes,
         preferences=payload.preferences,
         constraints=payload.constraints,
@@ -245,6 +310,8 @@ async def refine_route(payload: RouteRefineRequest) -> RouteGenerateResponse:
     return await _plan_routes(
         request_id=request_id,
         origin=payload.origin,
+        destination=payload.destination,
+        waypoints=payload.waypoints or [],
         duration_minutes=updated_duration,
         preferences=updated_preferences,
         constraints=updated_constraints,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+from typing import Iterable
 
 import httpx
 
@@ -9,6 +10,34 @@ from app.models import Constraints, Geometry, Location
 
 
 MAPBOX_DIRECTIONS_BASE = "https://api.mapbox.com/directions/v5/mapbox/walking"
+
+
+def _is_valid_location(location: Location | None) -> bool:
+    if location is None:
+        return False
+
+    if not (math.isfinite(location.lat) and math.isfinite(location.lng)):
+        return False
+
+    if not (-90.0 <= location.lat <= 90.0 and -180.0 <= location.lng <= 180.0):
+        return False
+
+    return True
+
+
+def _is_placeholder_location(location: Location) -> bool:
+    return abs(location.lat) < 1e-9 and abs(location.lng) < 1e-9
+
+
+def _sanitize_stops(points: Iterable[Location]) -> list[Location]:
+    sanitized: list[Location] = []
+    for point in points:
+        if not _is_valid_location(point):
+            continue
+        if _is_placeholder_location(point):
+            continue
+        sanitized.append(point)
+    return sanitized
 
 
 def _destination_for_walk(origin: Location, distance_meters: float, bearing_deg: float) -> tuple[float, float]:
@@ -73,6 +102,49 @@ async def _request_directions(
     return normalized
 
 
+async def _request_directions_for_stops(
+    client: httpx.AsyncClient,
+    token: str,
+    points: list[Location],
+    use_alternatives: bool,
+) -> list[dict]:
+    if len(points) < 2:
+      return []
+
+    coordinates = ";".join(f"{point.lng},{point.lat}" for point in points)
+    params = {
+        "alternatives": "true" if use_alternatives else "false",
+        "geometries": "geojson",
+        "overview": "full",
+        "steps": "false",
+        "access_token": token,
+    }
+
+    response = await client.get(f"{MAPBOX_DIRECTIONS_BASE}/{coordinates}", params=params)
+    response.raise_for_status()
+    data = response.json()
+
+    if data.get("code") != "Ok":
+        return []
+
+    routes = data.get("routes", [])
+    normalized: list[dict] = []
+    for route in routes:
+        geometry_data = route.get("geometry")
+        if not geometry_data or geometry_data.get("type") != "LineString":
+            continue
+
+        normalized.append(
+            {
+                "geometry": Geometry(type="LineString", coordinates=geometry_data.get("coordinates", [])),
+                "distanceMeters": int(route.get("distance", 0)),
+                "durationSeconds": int(route.get("duration", 0)),
+            }
+        )
+
+    return normalized
+
+
 def _dedupe_routes(routes: list[dict]) -> list[dict]:
     seen: set[tuple[int, int]] = set()
     result: list[dict] = []
@@ -115,6 +187,9 @@ async def build_mapbox_probe_routes(
     duration_minutes: int,
     constraints: Constraints,
 ) -> list[dict]:
+    if not _is_valid_location(origin) or _is_placeholder_location(origin):
+        return []
+
     token = os.getenv("MAPBOX_ACCESS_TOKEN", "").strip()
     if not token:
         return []
@@ -143,15 +218,18 @@ async def build_mapbox_probe_routes(
     async with httpx.AsyncClient(timeout=timeout) as client:
         for bearing, distance_factor, use_alternatives in candidate_specs:
             destination = _destination_for_walk(origin, target_distance * distance_factor, bearing)
-            all_routes.extend(
-                await _request_directions(
-                    client=client,
-                    token=token,
-                    origin=origin,
-                    destination=destination,
-                    use_alternatives=use_alternatives,
+            try:
+                all_routes.extend(
+                    await _request_directions(
+                        client=client,
+                        token=token,
+                        origin=origin,
+                        destination=destination,
+                        use_alternatives=use_alternatives,
+                    )
                 )
-            )
+            except httpx.HTTPError:
+                continue
 
             if len(all_routes) >= 7:
                 break
@@ -179,7 +257,40 @@ async def build_mapbox_routes(
     origin: Location,
     duration_minutes: int,
     constraints: Constraints,
+    destination: Location | None = None,
+    waypoints: list[Location] | None = None,
 ) -> list[dict]:
+    if not _is_valid_location(origin) or _is_placeholder_location(origin):
+        return []
+
+    if destination is not None:
+        token = os.getenv("MAPBOX_ACCESS_TOKEN", "").strip()
+        if not token:
+            return []
+
+        if not _is_valid_location(destination) or _is_placeholder_location(destination):
+            return []
+
+        intermediate_waypoints = _sanitize_stops(waypoints or [])
+        stops = [origin, *intermediate_waypoints, destination]
+        timeout = httpx.Timeout(6.0, connect=3.0)
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                routes = await _request_directions_for_stops(
+                    client=client,
+                    token=token,
+                    points=stops,
+                    use_alternatives=True,
+                )
+        except httpx.HTTPError:
+            return []
+
+        deduped = [route for route in _dedupe_routes(routes) if _is_valid_route(route)]
+        for index, route in enumerate(deduped[:3], start=1):
+            route["id"] = f"route_{index}"
+        return deduped[:3]
+
     try:
         from app.core.graph_routing import build_graph_routes
     except Exception:

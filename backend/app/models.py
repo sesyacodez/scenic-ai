@@ -8,6 +8,38 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 class Location(BaseModel):
     lat: float
     lng: float
+    label: str | None = None
+
+
+class LocationSearchRequest(BaseModel):
+    query: str = Field(min_length=2, max_length=120)
+    limit: int = Field(default=5, ge=1, le=8)
+    proximityLat: float | None = Field(default=None, ge=-90, le=90)
+    proximityLng: float | None = Field(default=None, ge=-180, le=180)
+
+    @model_validator(mode="after")
+    def validate_proximity_pair(self) -> "LocationSearchRequest":
+        has_lat = self.proximityLat is not None
+        has_lng = self.proximityLng is not None
+        if has_lat != has_lng:
+            raise ValueError("proximityLat and proximityLng must be provided together")
+        return self
+
+
+class ReverseGeocodeRequest(BaseModel):
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+
+
+class LocationSearchResult(BaseModel):
+    id: str
+    label: str
+    fullLabel: str
+    location: Location
+
+
+class LocationSearchResponse(BaseModel):
+    results: list[LocationSearchResult]
 
 
 class Preferences(BaseModel):
@@ -26,6 +58,8 @@ class Constraints(BaseModel):
 
 class RouteGenerateRequest(BaseModel):
     origin: Location
+    destination: Location | None = None
+    waypoints: list[Location] = Field(default_factory=list, max_length=3)
     durationMinutes: int = Field(ge=10, le=180)
     preferences: Preferences
     constraints: Constraints = Field(default_factory=Constraints)
@@ -37,6 +71,8 @@ class RouteRefineRequest(BaseModel):
     sessionId: str = Field(min_length=3)
     message: str = Field(min_length=2, max_length=500)
     origin: Location | None = None
+    destination: Location | None = None
+    waypoints: list[Location] | None = Field(default=None, max_length=3)
     durationMinutes: int | None = Field(default=None, ge=10, le=180)
     preferences: Preferences | None = None
     constraints: Constraints = Field(default_factory=Constraints)

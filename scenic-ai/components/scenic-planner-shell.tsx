@@ -73,8 +73,27 @@ type GeoOrigin = {
   accuracy: number;
 };
 
+type PlaceSuggestion = {
+  id: string;
+  label: string;
+  fullLabel: string;
+  location: {
+    lat: number;
+    lng: number;
+    label?: string | null;
+  };
+};
+
+type WaypointDraft = {
+  searchText: string;
+  label: string;
+  lat: string;
+  lng: string;
+};
+
 const STORAGE_KEY = "scenicai.session";
 const ORIGIN_STORAGE_KEY = "scenicai.origin";
+const STOPS_STORAGE_KEY = "scenicai.stops";
 
 const defaultPreferences: Preferences = {
   nature: true,
@@ -97,6 +116,8 @@ const MIN_SIDEBAR_WIDTH = 280;
 const MAX_SIDEBAR_WIDTH = 460;
 const DEFAULT_SIDEBAR_WIDTH = 308;
 const MAX_ACCEPTABLE_ACCURACY_METERS = 250;
+const ORIGIN_SEARCH_DEBOUNCE_MS = 220;
+const MAX_WAYPOINTS = 3;
 
 const resolveBackendBaseUrl = () => {
   if (process.env.NEXT_PUBLIC_BACKEND_BASE_URL) {
@@ -120,6 +141,35 @@ export function ScenicPlannerShell() {
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
   const [originLat, setOriginLat] = useState("");
   const [originLng, setOriginLng] = useState("");
+  const [originLabel, setOriginLabel] = useState("");
+  const [originSearchText, setOriginSearchText] = useState("");
+  const [originSuggestions, setOriginSuggestions] = useState<PlaceSuggestion[]>([]);
+  const [isOriginSearchLoading, setIsOriginSearchLoading] = useState(false);
+  const [showOriginSuggestions, setShowOriginSuggestions] = useState(false);
+  const [activeOriginSuggestionIndex, setActiveOriginSuggestionIndex] = useState(-1);
+  const [originSearchError, setOriginSearchError] = useState<string | null>(null);
+  const originSearchAbortRef = useRef<AbortController | null>(null);
+  const originSearchDebounceRef = useRef<number | null>(null);
+  const [destinationLat, setDestinationLat] = useState("");
+  const [destinationLng, setDestinationLng] = useState("");
+  const [destinationLabel, setDestinationLabel] = useState("");
+  const [destinationSearchText, setDestinationSearchText] = useState("");
+  const [destinationSuggestions, setDestinationSuggestions] = useState<PlaceSuggestion[]>([]);
+  const [isDestinationSearchLoading, setIsDestinationSearchLoading] = useState(false);
+  const [showDestinationSuggestions, setShowDestinationSuggestions] = useState(false);
+  const [activeDestinationSuggestionIndex, setActiveDestinationSuggestionIndex] = useState(-1);
+  const [destinationSearchError, setDestinationSearchError] = useState<string | null>(null);
+  const destinationSearchAbortRef = useRef<AbortController | null>(null);
+  const destinationSearchDebounceRef = useRef<number | null>(null);
+  const [waypoints, setWaypoints] = useState<WaypointDraft[]>([]);
+  const [activeWaypointIndex, setActiveWaypointIndex] = useState<number | null>(null);
+  const [waypointSuggestions, setWaypointSuggestions] = useState<PlaceSuggestion[]>([]);
+  const [isWaypointSearchLoading, setIsWaypointSearchLoading] = useState(false);
+  const [showWaypointSuggestions, setShowWaypointSuggestions] = useState(false);
+  const [activeWaypointSuggestionIndex, setActiveWaypointSuggestionIndex] = useState(-1);
+  const [waypointSearchError, setWaypointSearchError] = useState<string | null>(null);
+  const waypointSearchAbortRef = useRef<AbortController | null>(null);
+  const waypointSearchDebounceRef = useRef<number | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
   const [locationNote, setLocationNote] = useState<string | null>(null);
   const [routeTitle, setRouteTitle] = useState("Scenic Route");
@@ -187,11 +237,42 @@ export function ScenicPlannerShell() {
     }
 
     try {
-      const parsed = JSON.parse(raw) as { lat?: string; lng?: string };
+      const parsed = JSON.parse(raw) as { lat?: string; lng?: string; label?: string };
       setOriginLat(typeof parsed.lat === "string" ? parsed.lat : "");
       setOriginLng(typeof parsed.lng === "string" ? parsed.lng : "");
+      const label = typeof parsed.label === "string" ? parsed.label : "";
+      setOriginLabel(label);
+      setOriginSearchText(label);
     } catch {
       window.localStorage.removeItem(ORIGIN_STORAGE_KEY);
+    }
+  }, []);
+
+  useEffect(() => {
+    const raw = window.localStorage.getItem(STOPS_STORAGE_KEY);
+    if (!raw) {
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(raw) as {
+        destination?: { lat?: string; lng?: string; label?: string };
+        waypoints?: WaypointDraft[];
+      };
+
+      const destination = parsed.destination;
+      if (destination) {
+        setDestinationLat(typeof destination.lat === "string" ? destination.lat : "");
+        setDestinationLng(typeof destination.lng === "string" ? destination.lng : "");
+        const destinationText = typeof destination.label === "string" ? destination.label : "";
+        setDestinationLabel(destinationText);
+        setDestinationSearchText(destinationText);
+      }
+
+      const parsedWaypoints = Array.isArray(parsed.waypoints) ? parsed.waypoints : [];
+      setWaypoints(parsedWaypoints.slice(0, MAX_WAYPOINTS));
+    } catch {
+      window.localStorage.removeItem(STOPS_STORAGE_KEY);
     }
   }, []);
 
@@ -201,9 +282,299 @@ export function ScenicPlannerShell() {
       JSON.stringify({
         lat: originLat,
         lng: originLng,
+        label: originLabel,
       }),
     );
-  }, [originLat, originLng]);
+  }, [originLabel, originLat, originLng]);
+
+  useEffect(() => {
+    window.localStorage.setItem(
+      STOPS_STORAGE_KEY,
+      JSON.stringify({
+        destination: {
+          lat: destinationLat,
+          lng: destinationLng,
+          label: destinationLabel,
+        },
+        waypoints,
+      }),
+    );
+  }, [destinationLabel, destinationLat, destinationLng, waypoints]);
+
+  useEffect(() => {
+    return () => {
+      if (originSearchDebounceRef.current !== null) {
+        window.clearTimeout(originSearchDebounceRef.current);
+      }
+      originSearchAbortRef.current?.abort();
+      if (destinationSearchDebounceRef.current !== null) {
+        window.clearTimeout(destinationSearchDebounceRef.current);
+      }
+      destinationSearchAbortRef.current?.abort();
+      if (waypointSearchDebounceRef.current !== null) {
+        window.clearTimeout(waypointSearchDebounceRef.current);
+      }
+      waypointSearchAbortRef.current?.abort();
+    };
+  }, []);
+
+  const fetchOriginSuggestions = useCallback(
+    async (query: string) => {
+      originSearchAbortRef.current?.abort();
+      const controller = new AbortController();
+      originSearchAbortRef.current = controller;
+
+      setIsOriginSearchLoading(true);
+      setOriginSearchError(null);
+
+      try {
+        const response = await fetch(`${backendBaseUrl}/api/v1/location/search`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            query,
+            limit: 6,
+            proximityLat: mapCenter[1],
+            proximityLng: mapCenter[0],
+          }),
+          signal: controller.signal,
+        });
+
+        if (!response.ok) {
+          throw new Error(`Location search failed (${response.status})`);
+        }
+
+        const payload = (await response.json()) as { results?: PlaceSuggestion[] };
+        const nextSuggestions = Array.isArray(payload.results) ? payload.results : [];
+        setOriginSuggestions(nextSuggestions);
+        setShowOriginSuggestions(true);
+        setActiveOriginSuggestionIndex(nextSuggestions.length > 0 ? 0 : -1);
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") {
+          return;
+        }
+        setOriginSuggestions([]);
+        setActiveOriginSuggestionIndex(-1);
+        setOriginSearchError("Location search unavailable. You can still enter coordinates below.");
+      } finally {
+        setIsOriginSearchLoading(false);
+      }
+    },
+    [backendBaseUrl, mapCenter],
+  );
+
+  const fetchDestinationSuggestions = useCallback(
+    async (query: string) => {
+      destinationSearchAbortRef.current?.abort();
+      const controller = new AbortController();
+      destinationSearchAbortRef.current = controller;
+
+      setIsDestinationSearchLoading(true);
+      setDestinationSearchError(null);
+
+      try {
+        const response = await fetch(`${backendBaseUrl}/api/v1/location/search`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            query,
+            limit: 6,
+            proximityLat: mapCenter[1],
+            proximityLng: mapCenter[0],
+          }),
+          signal: controller.signal,
+        });
+
+        if (!response.ok) {
+          throw new Error(`Location search failed (${response.status})`);
+        }
+
+        const payload = (await response.json()) as { results?: PlaceSuggestion[] };
+        const nextSuggestions = Array.isArray(payload.results) ? payload.results : [];
+        setDestinationSuggestions(nextSuggestions);
+        setShowDestinationSuggestions(true);
+        setActiveDestinationSuggestionIndex(nextSuggestions.length > 0 ? 0 : -1);
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") {
+          return;
+        }
+        setDestinationSuggestions([]);
+        setActiveDestinationSuggestionIndex(-1);
+        setDestinationSearchError("Destination search unavailable right now.");
+      } finally {
+        setIsDestinationSearchLoading(false);
+      }
+    },
+    [backendBaseUrl, mapCenter],
+  );
+
+  const fetchWaypointSuggestions = useCallback(
+    async (query: string) => {
+      waypointSearchAbortRef.current?.abort();
+      const controller = new AbortController();
+      waypointSearchAbortRef.current = controller;
+
+      setIsWaypointSearchLoading(true);
+      setWaypointSearchError(null);
+
+      try {
+        const response = await fetch(`${backendBaseUrl}/api/v1/location/search`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            query,
+            limit: 6,
+            proximityLat: mapCenter[1],
+            proximityLng: mapCenter[0],
+          }),
+          signal: controller.signal,
+        });
+
+        if (!response.ok) {
+          throw new Error(`Location search failed (${response.status})`);
+        }
+
+        const payload = (await response.json()) as { results?: PlaceSuggestion[] };
+        const nextSuggestions = Array.isArray(payload.results) ? payload.results : [];
+        setWaypointSuggestions(nextSuggestions);
+        setShowWaypointSuggestions(true);
+        setActiveWaypointSuggestionIndex(nextSuggestions.length > 0 ? 0 : -1);
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") {
+          return;
+        }
+        setWaypointSuggestions([]);
+        setActiveWaypointSuggestionIndex(-1);
+        setWaypointSearchError("Waypoint search unavailable right now.");
+      } finally {
+        setIsWaypointSearchLoading(false);
+      }
+    },
+    [backendBaseUrl, mapCenter],
+  );
+
+  const reverseGeocodeOrigin = useCallback(
+    async (lat: number, lng: number) => {
+      try {
+        const response = await fetch(`${backendBaseUrl}/api/v1/location/reverse`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ lat, lng }),
+        });
+
+        if (!response.ok) {
+          return;
+        }
+
+        const payload = (await response.json()) as { results?: PlaceSuggestion[] };
+        const top = payload.results?.[0];
+        if (!top) {
+          return;
+        }
+
+        setOriginLabel(top.fullLabel);
+        setOriginSearchText(top.fullLabel);
+      } catch {
+        // Non-blocking fallback.
+      }
+    },
+    [backendBaseUrl],
+  );
+
+  useEffect(() => {
+    const query = originSearchText.trim();
+    if (!query || query.length < 2 || query === originLabel) {
+      setOriginSuggestions([]);
+      setShowOriginSuggestions(false);
+      setIsOriginSearchLoading(false);
+      setOriginSearchError(null);
+      return;
+    }
+
+    if (originSearchDebounceRef.current !== null) {
+      window.clearTimeout(originSearchDebounceRef.current);
+    }
+
+    originSearchDebounceRef.current = window.setTimeout(() => {
+      fetchOriginSuggestions(query);
+    }, ORIGIN_SEARCH_DEBOUNCE_MS);
+
+    return () => {
+      if (originSearchDebounceRef.current !== null) {
+        window.clearTimeout(originSearchDebounceRef.current);
+      }
+    };
+  }, [fetchOriginSuggestions, originLabel, originSearchText]);
+
+  useEffect(() => {
+    const query = destinationSearchText.trim();
+    if (!query || query.length < 2 || query === destinationLabel) {
+      setDestinationSuggestions([]);
+      setShowDestinationSuggestions(false);
+      setIsDestinationSearchLoading(false);
+      setDestinationSearchError(null);
+      return;
+    }
+
+    if (destinationSearchDebounceRef.current !== null) {
+      window.clearTimeout(destinationSearchDebounceRef.current);
+    }
+
+    destinationSearchDebounceRef.current = window.setTimeout(() => {
+      fetchDestinationSuggestions(query);
+    }, ORIGIN_SEARCH_DEBOUNCE_MS);
+
+    return () => {
+      if (destinationSearchDebounceRef.current !== null) {
+        window.clearTimeout(destinationSearchDebounceRef.current);
+      }
+    };
+  }, [destinationLabel, destinationSearchText, fetchDestinationSuggestions]);
+
+  useEffect(() => {
+    if (activeWaypointIndex === null) {
+      setShowWaypointSuggestions(false);
+      return;
+    }
+
+    const activeWaypoint = waypoints[activeWaypointIndex];
+    const query = activeWaypoint?.searchText.trim() ?? "";
+    if (!query || query.length < 2 || query === activeWaypoint?.label) {
+      setWaypointSuggestions([]);
+      setShowWaypointSuggestions(false);
+      setIsWaypointSearchLoading(false);
+      setWaypointSearchError(null);
+      return;
+    }
+
+    if (waypointSearchDebounceRef.current !== null) {
+      window.clearTimeout(waypointSearchDebounceRef.current);
+    }
+
+    waypointSearchDebounceRef.current = window.setTimeout(() => {
+      fetchWaypointSuggestions(query);
+    }, ORIGIN_SEARCH_DEBOUNCE_MS);
+
+    return () => {
+      if (waypointSearchDebounceRef.current !== null) {
+        window.clearTimeout(waypointSearchDebounceRef.current);
+      }
+    };
+  }, [activeWaypointIndex, fetchWaypointSuggestions, waypoints]);
+
+  useEffect(() => {
+    if (originLabel) {
+      return;
+    }
+
+    const latValue = Number(originLat);
+    const lngValue = Number(originLng);
+    if (!Number.isFinite(latValue) || !Number.isFinite(lngValue)) {
+      return;
+    }
+
+    void reverseGeocodeOrigin(latValue, lngValue);
+  }, [originLabel, originLat, originLng, reverseGeocodeOrigin]);
 
   const selectedPreferences = useMemo(
     () => Object.entries(preferences).filter(([, enabled]) => enabled).map(([key]) => key),
@@ -376,6 +747,221 @@ export function ScenicPlannerShell() {
     }));
   };
 
+  const applyOriginSuggestion = (suggestion: PlaceSuggestion) => {
+    setOriginLat(suggestion.location.lat.toFixed(5));
+    setOriginLng(suggestion.location.lng.toFixed(5));
+    setOriginLabel(suggestion.fullLabel);
+    setOriginSearchText(suggestion.fullLabel);
+    setOriginSuggestions([]);
+    setShowOriginSuggestions(false);
+    setActiveOriginSuggestionIndex(-1);
+    setMapCenter([suggestion.location.lng, suggestion.location.lat]);
+  };
+
+  const applyDestinationSuggestion = (suggestion: PlaceSuggestion) => {
+    setDestinationLat(suggestion.location.lat.toFixed(5));
+    setDestinationLng(suggestion.location.lng.toFixed(5));
+    setDestinationLabel(suggestion.fullLabel);
+    setDestinationSearchText(suggestion.fullLabel);
+    setDestinationSuggestions([]);
+    setShowDestinationSuggestions(false);
+    setActiveDestinationSuggestionIndex(-1);
+  };
+
+  const addWaypoint = () => {
+    setWaypoints((prev) => {
+      if (prev.length >= MAX_WAYPOINTS) {
+        return prev;
+      }
+      return [...prev, { searchText: "", label: "", lat: "", lng: "" }];
+    });
+  };
+
+  const removeWaypoint = (index: number) => {
+    setWaypoints((prev) => prev.filter((_, waypointIndex) => waypointIndex !== index));
+    setActiveWaypointIndex((prev) => {
+      if (prev === null) {
+        return prev;
+      }
+      if (prev === index) {
+        return null;
+      }
+      return prev > index ? prev - 1 : prev;
+    });
+    setShowWaypointSuggestions(false);
+  };
+
+  const updateWaypointSearchText = (index: number, value: string) => {
+    setWaypoints((prev) =>
+      prev.map((waypoint, waypointIndex) =>
+        waypointIndex === index
+          ? {
+              ...waypoint,
+              searchText: value,
+              label: "",
+              lat: "",
+              lng: "",
+            }
+          : waypoint,
+      ),
+    );
+  };
+
+  const applyWaypointSuggestion = (index: number, suggestion: PlaceSuggestion) => {
+    setWaypoints((prev) =>
+      prev.map((waypoint, waypointIndex) =>
+        waypointIndex === index
+          ? {
+              ...waypoint,
+              searchText: suggestion.fullLabel,
+              label: suggestion.fullLabel,
+              lat: suggestion.location.lat.toFixed(5),
+              lng: suggestion.location.lng.toFixed(5),
+            }
+          : waypoint,
+      ),
+    );
+    setWaypointSuggestions([]);
+    setShowWaypointSuggestions(false);
+    setActiveWaypointSuggestionIndex(-1);
+  };
+
+  const normalizeStop = (latText: string, lngText: string, labelText: string) => {
+    const normalizedLatText = latText.trim();
+    const normalizedLngText = lngText.trim();
+    if (!normalizedLatText || !normalizedLngText) {
+      return null;
+    }
+
+    const latValue = Number(normalizedLatText);
+    const lngValue = Number(normalizedLngText);
+    if (!Number.isFinite(latValue) || !Number.isFinite(lngValue)) {
+      return null;
+    }
+
+    if (latValue < -90 || latValue > 90 || lngValue < -180 || lngValue > 180) {
+      return null;
+    }
+
+    return {
+      lat: latValue,
+      lng: lngValue,
+      label: labelText.trim() || undefined,
+    };
+  };
+
+  const toStopsPayload = () => {
+    const destination = normalizeStop(destinationLat, destinationLng, destinationLabel || destinationSearchText);
+
+    const waypointPayload = waypoints
+      .map((waypoint) => normalizeStop(waypoint.lat, waypoint.lng, waypoint.label || waypoint.searchText))
+      .filter((item) => item !== null)
+      .slice(0, MAX_WAYPOINTS);
+
+    return { destination, waypoints: waypointPayload };
+  };
+
+  const handleOriginSearchKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      if (!showOriginSuggestions && originSuggestions.length > 0) {
+        setShowOriginSuggestions(true);
+      }
+      setActiveOriginSuggestionIndex((prev) =>
+        originSuggestions.length === 0 ? -1 : Math.min(prev + 1, originSuggestions.length - 1),
+      );
+      return;
+    }
+
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setActiveOriginSuggestionIndex((prev) => (originSuggestions.length === 0 ? -1 : Math.max(prev - 1, 0)));
+      return;
+    }
+
+    if (event.key === "Enter") {
+      if (showOriginSuggestions && activeOriginSuggestionIndex >= 0 && originSuggestions[activeOriginSuggestionIndex]) {
+        event.preventDefault();
+        applyOriginSuggestion(originSuggestions[activeOriginSuggestionIndex]);
+      }
+      return;
+    }
+
+    if (event.key === "Escape") {
+      setShowOriginSuggestions(false);
+    }
+  };
+
+  const handleDestinationSearchKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      if (!showDestinationSuggestions && destinationSuggestions.length > 0) {
+        setShowDestinationSuggestions(true);
+      }
+      setActiveDestinationSuggestionIndex((prev) =>
+        destinationSuggestions.length === 0 ? -1 : Math.min(prev + 1, destinationSuggestions.length - 1),
+      );
+      return;
+    }
+
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setActiveDestinationSuggestionIndex((prev) =>
+        destinationSuggestions.length === 0 ? -1 : Math.max(prev - 1, 0),
+      );
+      return;
+    }
+
+    if (
+      event.key === "Enter" &&
+      showDestinationSuggestions &&
+      activeDestinationSuggestionIndex >= 0 &&
+      destinationSuggestions[activeDestinationSuggestionIndex]
+    ) {
+      event.preventDefault();
+      applyDestinationSuggestion(destinationSuggestions[activeDestinationSuggestionIndex]);
+      return;
+    }
+
+    if (event.key === "Escape") {
+      setShowDestinationSuggestions(false);
+    }
+  };
+
+  const handleWaypointSearchKeyDown = (event: React.KeyboardEvent<HTMLInputElement>, index: number) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      if (!showWaypointSuggestions && waypointSuggestions.length > 0) {
+        setShowWaypointSuggestions(true);
+      }
+      setActiveWaypointSuggestionIndex((prev) =>
+        waypointSuggestions.length === 0 ? -1 : Math.min(prev + 1, waypointSuggestions.length - 1),
+      );
+      return;
+    }
+
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setActiveWaypointSuggestionIndex((prev) => (waypointSuggestions.length === 0 ? -1 : Math.max(prev - 1, 0)));
+      return;
+    }
+
+    if (
+      event.key === "Enter" &&
+      showWaypointSuggestions &&
+      activeWaypointSuggestionIndex >= 0 &&
+      waypointSuggestions[activeWaypointSuggestionIndex]
+    ) {
+      event.preventDefault();
+      applyWaypointSuggestion(index, waypointSuggestions[activeWaypointSuggestionIndex]);
+      return;
+    }
+
+    if (event.key === "Escape") {
+      setShowWaypointSuggestions(false);
+    }
+  };
+
   const handleGenerate = async () => {
     setRequestError(null);
     setLocationNote(null);
@@ -384,7 +970,7 @@ export function ScenicPlannerShell() {
     const origin = await resolveOrigin();
     if (!origin) {
       setStatus("idle");
-      setRequestError("Location unavailable. Enter latitude/longitude or allow geolocation.");
+      setRequestError("Location unavailable. Search for a place, enter coordinates, or allow geolocation.");
       return;
     }
 
@@ -394,12 +980,21 @@ export function ScenicPlannerShell() {
       );
     }
 
+    const stopsPayload = toStopsPayload();
+    if (destinationSearchText.trim() && !stopsPayload.destination) {
+      setStatus("idle");
+      setRequestError("Pick a destination from suggestions, or clear destination text.");
+      return;
+    }
+
     try {
       const response = await fetch(`${backendBaseUrl}/api/v1/route/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           origin,
+          destination: stopsPayload.destination,
+          waypoints: stopsPayload.waypoints,
           durationMinutes,
           preferences: toPreferenceWeights(),
           constraints: { avoidBusyRoads: preferences.quiet },
@@ -438,9 +1033,11 @@ export function ScenicPlannerShell() {
     const origin = await resolveOrigin();
     if (!origin) {
       setStatus("idle");
-      setRequestError("Location unavailable. Enter latitude/longitude or allow geolocation.");
+      setRequestError("Location unavailable. Search for a place, enter coordinates, or allow geolocation.");
       return;
     }
+
+    const stopsPayload = toStopsPayload();
 
     try {
       const response = await fetch(`${backendBaseUrl}/api/v1/route/refine`, {
@@ -450,6 +1047,8 @@ export function ScenicPlannerShell() {
           sessionId: "anon-web-session",
           message,
           origin,
+          destination: stopsPayload.destination,
+          waypoints: stopsPayload.waypoints,
           durationMinutes,
           preferences: toPreferenceWeights(),
           constraints: { avoidBusyRoads: preferences.quiet },
@@ -493,6 +1092,7 @@ export function ScenicPlannerShell() {
 
     setOriginLat(origin.lat.toFixed(5));
     setOriginLng(origin.lng.toFixed(5));
+    void reverseGeocodeOrigin(origin.lat, origin.lng);
     setMapCenter([origin.lng, origin.lat]);
   };
 
@@ -567,20 +1167,86 @@ export function ScenicPlannerShell() {
           <div className="mt-10 space-y-6">
             <section>
               <p className="text-sm font-medium">Starting Point</p>
-              <div className="mt-3 grid grid-cols-2 gap-2">
+              <div className="relative mt-3">
                 <input
-                  value={originLat}
-                  onChange={(event) => setOriginLat(event.target.value)}
-                  placeholder="Latitude"
-                  className="h-9 rounded-xl border border-panel-border bg-white px-3 text-sm"
+                  value={originSearchText}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    setOriginSearchText(value);
+                    setOriginLabel("");
+                    setOriginLat("");
+                    setOriginLng("");
+                    setOriginSearchError(null);
+                    setShowOriginSuggestions(true);
+                  }}
+                  onFocus={() => {
+                    if (originSuggestions.length > 0) {
+                      setShowOriginSuggestions(true);
+                    }
+                  }}
+                  onBlur={() => {
+                    window.setTimeout(() => {
+                      setShowOriginSuggestions(false);
+                    }, 120);
+                  }}
+                  onKeyDown={handleOriginSearchKeyDown}
+                  placeholder="Search address, place, or landmark"
+                  className="h-9 w-full rounded-xl border border-panel-border bg-white px-3 text-sm"
+                  aria-label="Search starting location"
+                  aria-autocomplete="list"
                 />
-                <input
-                  value={originLng}
-                  onChange={(event) => setOriginLng(event.target.value)}
-                  placeholder="Longitude"
-                  className="h-9 rounded-xl border border-panel-border bg-white px-3 text-sm"
-                />
+                {showOriginSuggestions && (isOriginSearchLoading || originSuggestions.length > 0) ? (
+                  <div className="absolute z-20 mt-1 w-full rounded-xl border border-panel-border bg-white p-1 shadow-sm">
+                    {isOriginSearchLoading ? (
+                      <p className="px-2 py-1 text-xs text-app-muted">Searching...</p>
+                    ) : (
+                      <ul role="listbox" className="max-h-44 overflow-auto">
+                        {originSuggestions.map((suggestion, index) => (
+                          <li key={suggestion.id}>
+                            <button
+                              type="button"
+                              onMouseDown={(event) => {
+                                event.preventDefault();
+                                applyOriginSuggestion(suggestion);
+                              }}
+                              className={`w-full rounded-lg px-2 py-2 text-left text-xs ${
+                                index === activeOriginSuggestionIndex ? "bg-accent/10 text-app-foreground" : "text-app-muted"
+                              }`}
+                            >
+                              <p className="font-medium text-app-foreground">{suggestion.label}</p>
+                              <p>{suggestion.fullLabel}</p>
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                ) : null}
               </div>
+              {originSearchError ? <p className="mt-1 text-xs text-amber-700">{originSearchError}</p> : null}
+              <details className="mt-2 rounded-xl border border-panel-border bg-white p-2">
+                <summary className="cursor-pointer text-xs text-app-muted">Enter coordinates manually</summary>
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  <input
+                    value={originLat}
+                    onChange={(event) => {
+                      setOriginLat(event.target.value);
+                      setOriginLabel("");
+                    }}
+                    placeholder="Latitude"
+                    className="h-9 rounded-xl border border-panel-border bg-white px-3 text-sm"
+                  />
+                  <input
+                    value={originLng}
+                    onChange={(event) => {
+                      setOriginLng(event.target.value);
+                      setOriginLabel("");
+                    }}
+                    placeholder="Longitude"
+                    className="h-9 rounded-xl border border-panel-border bg-white px-3 text-sm"
+                  />
+                </div>
+              </details>
               <button
                 type="button"
                 onClick={handleUseMyLocation}
@@ -588,6 +1254,157 @@ export function ScenicPlannerShell() {
               >
                 Use my location
               </button>
+            </section>
+
+            <section>
+              <p className="text-sm font-medium">Destination (Optional)</p>
+              <div className="relative mt-3">
+                <input
+                  value={destinationSearchText}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    setDestinationSearchText(value);
+                    setDestinationLabel("");
+                    setDestinationLat("");
+                    setDestinationLng("");
+                    setDestinationSearchError(null);
+                    setShowDestinationSuggestions(true);
+                  }}
+                  onFocus={() => {
+                    if (destinationSuggestions.length > 0) {
+                      setShowDestinationSuggestions(true);
+                    }
+                  }}
+                  onBlur={() => {
+                    window.setTimeout(() => {
+                      setShowDestinationSuggestions(false);
+                    }, 120);
+                  }}
+                  onKeyDown={handleDestinationSearchKeyDown}
+                  placeholder="Search destination"
+                  className="h-9 w-full rounded-xl border border-panel-border bg-white px-3 text-sm"
+                  aria-label="Search destination"
+                  aria-autocomplete="list"
+                />
+                {showDestinationSuggestions && (isDestinationSearchLoading || destinationSuggestions.length > 0) ? (
+                  <div className="absolute z-20 mt-1 w-full rounded-xl border border-panel-border bg-white p-1 shadow-sm">
+                    {isDestinationSearchLoading ? (
+                      <p className="px-2 py-1 text-xs text-app-muted">Searching...</p>
+                    ) : (
+                      <ul role="listbox" className="max-h-44 overflow-auto">
+                        {destinationSuggestions.map((suggestion, index) => (
+                          <li key={suggestion.id}>
+                            <button
+                              type="button"
+                              onMouseDown={(event) => {
+                                event.preventDefault();
+                                applyDestinationSuggestion(suggestion);
+                              }}
+                              className={`w-full rounded-lg px-2 py-2 text-left text-xs ${
+                                index === activeDestinationSuggestionIndex
+                                  ? "bg-accent/10 text-app-foreground"
+                                  : "text-app-muted"
+                              }`}
+                            >
+                              <p className="font-medium text-app-foreground">{suggestion.label}</p>
+                              <p>{suggestion.fullLabel}</p>
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                ) : null}
+              </div>
+              {destinationSearchError ? <p className="mt-1 text-xs text-amber-700">{destinationSearchError}</p> : null}
+            </section>
+
+            <section>
+              <div className="flex items-center justify-between">
+                <p className="text-sm font-medium">Waypoints (Optional)</p>
+                <button
+                  type="button"
+                  onClick={addWaypoint}
+                  disabled={waypoints.length >= MAX_WAYPOINTS}
+                  className="h-7 rounded-lg border border-panel-border bg-white px-2 text-xs disabled:opacity-50"
+                >
+                  Add waypoint
+                </button>
+              </div>
+              <div className="mt-3 space-y-2">
+                {waypoints.length === 0 ? (
+                  <p className="text-xs text-app-muted">Add up to 3 waypoint stops.</p>
+                ) : null}
+                {waypoints.map((waypoint, index) => (
+                  <div key={`waypoint-${index}`} className="relative rounded-xl border border-panel-border bg-white p-2">
+                    <div className="mb-2 flex items-center justify-between">
+                      <p className="text-xs font-medium text-app-muted">Waypoint {index + 1}</p>
+                      <button
+                        type="button"
+                        onClick={() => removeWaypoint(index)}
+                        className="text-xs text-app-muted hover:text-app-foreground"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                    <input
+                      value={waypoint.searchText}
+                      onChange={(event) => {
+                        updateWaypointSearchText(index, event.target.value);
+                        setWaypointSearchError(null);
+                        setActiveWaypointIndex(index);
+                        setShowWaypointSuggestions(true);
+                      }}
+                      onFocus={() => {
+                        setActiveWaypointIndex(index);
+                        if (waypointSuggestions.length > 0) {
+                          setShowWaypointSuggestions(true);
+                        }
+                      }}
+                      onBlur={() => {
+                        window.setTimeout(() => {
+                          setShowWaypointSuggestions(false);
+                        }, 120);
+                      }}
+                      onKeyDown={(event) => handleWaypointSearchKeyDown(event, index)}
+                      placeholder="Search waypoint"
+                      className="h-8 w-full rounded-lg border border-panel-border px-2 text-xs"
+                      aria-label={`Search waypoint ${index + 1}`}
+                    />
+
+                    {activeWaypointIndex === index && showWaypointSuggestions && (isWaypointSearchLoading || waypointSuggestions.length > 0) ? (
+                      <div className="absolute left-2 right-2 top-[70px] z-20 rounded-xl border border-panel-border bg-white p-1 shadow-sm">
+                        {isWaypointSearchLoading ? (
+                          <p className="px-2 py-1 text-xs text-app-muted">Searching...</p>
+                        ) : (
+                          <ul role="listbox" className="max-h-40 overflow-auto">
+                            {waypointSuggestions.map((suggestion, suggestionIndex) => (
+                              <li key={suggestion.id}>
+                                <button
+                                  type="button"
+                                  onMouseDown={(event) => {
+                                    event.preventDefault();
+                                    applyWaypointSuggestion(index, suggestion);
+                                  }}
+                                  className={`w-full rounded-lg px-2 py-2 text-left text-xs ${
+                                    suggestionIndex === activeWaypointSuggestionIndex
+                                      ? "bg-accent/10 text-app-foreground"
+                                      : "text-app-muted"
+                                  }`}
+                                >
+                                  <p className="font-medium text-app-foreground">{suggestion.label}</p>
+                                  <p>{suggestion.fullLabel}</p>
+                                </button>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+              {waypointSearchError ? <p className="mt-1 text-xs text-amber-700">{waypointSearchError}</p> : null}
             </section>
 
             <section>

@@ -13,6 +13,14 @@ from app.models import AppliedWeights, Preferences, ScoreBreakdown, ScoreDebug, 
 OVERPASS_INTERPRETER_URL = os.getenv(
     "OVERPASS_INTERPRETER_URL", "https://overpass-api.de/api/interpreter"
 )
+OVERPASS_INTERPRETER_URLS = [
+    url.strip()
+    for url in os.getenv(
+        "OVERPASS_INTERPRETER_URLS",
+        f"{OVERPASS_INTERPRETER_URL},https://overpass.kumi.systems/api/interpreter",
+    ).split(",")
+    if url.strip()
+]
 
 NATURE_NATURAL_TAGS = {
     "wood",
@@ -127,6 +135,26 @@ def _build_overpass_query(points: list[tuple[float, float]], radius_meters: int 
 );
 out center tags;
 """.strip()
+
+
+async def _request_overpass_payload(client: httpx.AsyncClient, query: str) -> dict | None:
+    headers = {
+        "User-Agent": "ScenicAI/0.1 (+https://scenicai.local)",
+        "Accept": "application/json",
+    }
+
+    for endpoint in OVERPASS_INTERPRETER_URLS:
+        for attempt in range(3):
+            try:
+                response = await client.post(endpoint, data={"data": query}, headers=headers)
+                response.raise_for_status()
+                return response.json()
+            except (httpx.HTTPError, ValueError):
+                if attempt < 2:
+                    await asyncio.sleep(0.45 * (attempt + 1))
+                continue
+
+    return None
 
 
 def _empty_debug_matches() -> dict[str, list[dict]]:
@@ -248,17 +276,7 @@ async def _fetch_overpass_route_context(
 
     query = _build_overpass_query(points)
 
-    payload: dict | None = None
-    for attempt in range(2):
-        try:
-            response = await client.post(OVERPASS_INTERPRETER_URL, data={"data": query})
-            response.raise_for_status()
-            payload = response.json()
-            break
-        except (httpx.HTTPError, ValueError):
-            if attempt == 1:
-                return 0, 0, 0, 0, 0, 0, 0, False, _empty_debug_matches(), True
-
+    payload = await _request_overpass_payload(client=client, query=query)
     if payload is None:
         return 0, 0, 0, 0, 0, 0, 0, False, _empty_debug_matches(), True
 
@@ -442,8 +460,9 @@ async def score_routes(routes: list[dict], preferences: Preferences) -> tuple[li
 
     timeout = httpx.Timeout(8.0, connect=3.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        context_tasks = [_fetch_route_context(client=client, route=route) for route in routes]
-        route_contexts = await asyncio.gather(*context_tasks)
+        route_contexts = []
+        for route in routes:
+            route_contexts.append(await _fetch_route_context(client=client, route=route))
 
     for route, context in zip(routes, route_contexts):
         (
@@ -495,5 +514,12 @@ async def score_routes(routes: list[dict], preferences: Preferences) -> tuple[li
             }
         )
 
-    ranked = sorted(scored_routes, key=lambda item: item["scenicScore"], reverse=True)
+    ranked = sorted(
+        scored_routes,
+        key=lambda item: (
+            item["scenicScore"],
+            1 if getattr(item["scoreDebug"], "contextAvailable", False) else 0,
+        ),
+        reverse=True,
+    )
     return ranked, weights
