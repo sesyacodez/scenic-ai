@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import socket
+import logging
 from pathlib import Path
 from uuid import uuid4
 
@@ -51,11 +52,13 @@ from app.models import (
     RouteResult,
 )
 from app.services.location_search import reverse_geocode, search_locations
+from app.services.ai_poi_selector import select_must_see_waypoints
 from app.services.mapbox_routes import build_mapbox_probe_routes, build_mapbox_routes
 from app.services.mock_routes import build_mock_routes
 from app.services.scoring import score_routes
 
 app = FastAPI(title="ScenicAI Backend", version="0.1.0")
+logger = logging.getLogger("scenicai.backend")
 
 cors_allow_origins_env = os.getenv("CORS_ALLOW_ORIGINS", "")
 configured_cors_origins = {origin.strip() for origin in cors_allow_origins_env.split(",") if origin.strip()}
@@ -216,13 +219,49 @@ async def _plan_routes(
     preferences: Preferences,
     constraints: Constraints,
     extra_reasons: list[str] | None = None,
+    refinement_text: str | None = None,
 ) -> RouteGenerateResponse:
+    ai_used = False
+    ai_fallback_reason: str | None = None
+    selected_pois = []
+    ai_selection_mode: str | None = None
+    ai_selection_latency_ms: int | None = None
+    route_waypoints = waypoints
+
+    if destination is not None:
+        (
+            route_waypoints,
+            selected_pois,
+            ai_used,
+            ai_fallback_reason,
+            ai_selection_mode,
+            ai_selection_latency_ms,
+        ) = await select_must_see_waypoints(
+            origin=origin,
+            destination=destination,
+            waypoints=waypoints,
+            duration_minutes=duration_minutes,
+            preferences=preferences,
+            refinement_text=refinement_text,
+            max_new_waypoints=1,
+        )
+
+    logger.info(
+        "route_request_id=%s ai_used=%s ai_selection_mode=%s ai_selection_latency_ms=%s ai_fallback_reason=%s selected_poi_count=%s",
+        request_id,
+        ai_used,
+        ai_selection_mode,
+        ai_selection_latency_ms,
+        ai_fallback_reason,
+        len(selected_pois),
+    )
+
     candidates = await build_mapbox_routes(
         origin=origin,
         duration_minutes=duration_minutes,
         constraints=constraints,
         destination=destination,
-        waypoints=waypoints,
+        waypoints=route_waypoints,
     )
 
     used_probe_fallback = False
@@ -254,6 +293,10 @@ async def _plan_routes(
         reasons.append("Used legacy probe routing fallback after graph construction failure")
     if used_mock_fallback:
         reasons.append("Used deterministic mock fallback due to route provider availability")
+    if ai_used and selected_pois:
+        reasons.append("Included an AI-selected must-see waypoint before deterministic route generation")
+    elif ai_fallback_reason:
+        reasons.append(ai_fallback_reason)
     if extra_reasons:
         reasons = extra_reasons + reasons
 
@@ -269,6 +312,11 @@ async def _plan_routes(
         routes=routes,
         explanation=explanation,
         appliedWeights=weights,
+        aiUsed=ai_used,
+        aiFallbackReason=ai_fallback_reason,
+        selectedPois=selected_pois,
+        aiSelectionMode=ai_selection_mode,
+        aiSelectionLatencyMs=ai_selection_latency_ms,
     )
 
 
@@ -288,6 +336,7 @@ async def generate_route(payload: RouteGenerateRequest) -> RouteGenerateResponse
         duration_minutes=payload.durationMinutes,
         preferences=payload.preferences,
         constraints=payload.constraints,
+        refinement_text=payload.refinementText,
     )
 
 
@@ -353,4 +402,5 @@ async def refine_route(payload: RouteRefineRequest) -> RouteGenerateResponse:
         preferences=updated_preferences,
         constraints=updated_constraints,
         extra_reasons=refinement_reasons,
+        refinement_text=payload.message,
     )

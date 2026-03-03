@@ -160,6 +160,15 @@ class AppliedWeights(BaseModel):
         return self
 
 
+class SelectedPoi(BaseModel):
+    id: str
+    name: str
+    location: Location
+    source: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    relevanceScore: float = Field(ge=0.0, le=1.0)
+
+
 class RouteGenerateResponse(BaseModel):
     status: Literal["ok", "no_route"]
     requestId: str
@@ -167,6 +176,11 @@ class RouteGenerateResponse(BaseModel):
     routes: list[RouteResult]
     explanation: Explanation
     appliedWeights: AppliedWeights
+    aiUsed: bool = False
+    aiFallbackReason: str | None = None
+    selectedPois: list[SelectedPoi] = Field(default_factory=list)
+    aiSelectionMode: str | None = None
+    aiSelectionLatencyMs: int | None = None
 
 
 class ErrorBody(BaseModel):

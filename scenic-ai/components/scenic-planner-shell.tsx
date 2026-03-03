@@ -70,6 +70,20 @@ type GenerateResponse = {
     summary: string;
     reasons: string[];
   };
+  aiUsed?: boolean;
+  aiFallbackReason?: string | null;
+  selectedPois?: Array<{
+    id: string;
+    name: string;
+    source: string;
+    confidence: number;
+    relevanceScore: number;
+    location: {
+      lat: number;
+      lng: number;
+      label?: string | null;
+    };
+  }>;
 };
 
 type BackendErrorPayload = {
@@ -214,6 +228,7 @@ export function ScenicPlannerShell() {
   const waypointSearchDebounceRef = useRef<number | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
   const [locationNote, setLocationNote] = useState<string | null>(null);
+  const [aiRouteNote, setAiRouteNote] = useState<string | null>(null);
   const [routeTitle, setRouteTitle] = useState("Scenic Route");
   const [routeMeta, setRouteMeta] = useState("—");
   const [scenicScore, setScenicScore] = useState<number | null>(null);
@@ -777,6 +792,15 @@ export function ScenicPlannerShell() {
     origin: { lat: number; lng: number },
     fallbackNoRouteMessage: string,
   ) => {
+    const selectedPoiCount = Array.isArray(payload.selectedPois) ? payload.selectedPois.length : 0;
+    if (payload.aiUsed === false && payload.aiFallbackReason) {
+      setAiRouteNote(`AI waypoint selection was unavailable: ${payload.aiFallbackReason}.`);
+    } else if (payload.aiUsed && selectedPoiCount > 0) {
+      setAiRouteNote(`AI selected ${selectedPoiCount} must-see waypoint${selectedPoiCount === 1 ? "" : "s"}.`);
+    } else {
+      setAiRouteNote(null);
+    }
+
     if (payload.routes.length === 0 || payload.selectedRouteId === null) {
       setExplanationText(payload.explanation.summary);
       setRequestError(fallbackNoRouteMessage);
@@ -1036,6 +1060,7 @@ export function ScenicPlannerShell() {
   const handleGenerate = async () => {
     setRequestError(null);
     setLocationNote(null);
+    setAiRouteNote(null);
     setStatus("generating");
 
     const origin = await resolveOrigin();
@@ -1106,6 +1131,7 @@ export function ScenicPlannerShell() {
     }
 
     setRequestError(null);
+    setAiRouteNote(null);
     setStatus("refining");
 
     const origin = await resolveOrigin();
@@ -1557,6 +1583,7 @@ export function ScenicPlannerShell() {
 
             {requestError ? <p className="text-xs text-red-600">{requestError}</p> : null}
             {locationNote ? <p className="text-xs text-amber-700">{locationNote}</p> : null}
+            {aiRouteNote ? <p className="text-xs text-app-muted">{aiRouteNote}</p> : null}
 
             <section className="space-y-3 border-t border-panel-border pt-4">
               <div className="flex items-start justify-between gap-3">

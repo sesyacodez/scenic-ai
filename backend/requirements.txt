@@ -6,3 +6,5 @@ python-dotenv==1.1.1
 osmnx
 networkx
 scipy
+langgraph>=0.2,<1
+langchain-openai>=0.2,<1
