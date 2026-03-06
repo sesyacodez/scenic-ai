@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
@@ -498,8 +499,8 @@ async def select_must_see_waypoints(
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            for query, query_lat, query_lng, query_radius_meters, query_max_results in query_plan:
-                candidates = await _query_google_places(
+            query_tasks = [
+                _query_google_places(
                     client=client,
                     api_key=google_api_key,
                     query=query,
@@ -508,7 +509,13 @@ async def select_must_see_waypoints(
                     radius_meters=query_radius_meters,
                     max_results=query_max_results,
                 )
-                for item in candidates:
+                for query, query_lat, query_lng, query_radius_meters, query_max_results in query_plan
+            ]
+            results = await asyncio.gather(*query_tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    continue
+                for item in result:
                     existing = deduped.get(item.place_id)
                     deduped[item.place_id] = _pick_better_candidate(existing, item) if existing is not None else item
     except httpx.HTTPError:

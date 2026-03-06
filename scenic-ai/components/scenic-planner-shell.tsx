@@ -2,24 +2,28 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ScenicMap } from "@/components/scenic-map";
+import { type PlaceSuggestion, useLocationSearch } from "@/hooks/use-location-search";
 
 type PreferenceKey = "nature" | "water" | "historic" | "quiet" | "viewpoints" | "culture" | "cafes";
 
 type Preferences = Record<PreferenceKey, boolean>;
 
 type SessionState = {
-  schemaVersion: 2;
+  schemaVersion: 4;
   durationMinutes: number;
-  preferences: Preferences;
+  customDuration: boolean;
+  avoidBusyRoads: boolean;
   refineText: string;
-  includeMustSees: boolean;
 };
 
 type LegacySessionState = {
-  schemaVersion: 1;
-  durationMinutes: number;
-  preferences: Partial<Preferences>;
-  refineText: string;
+  schemaVersion?: number;
+  durationMinutes?: number;
+  customDuration?: boolean;
+  preferences?: Partial<Preferences>;
+  avoidBusyRoads?: boolean;
+  refineText?: string;
+  includeMustSees?: boolean;
 };
 
 type GeneratedRoute = {
@@ -65,6 +69,8 @@ type ScoreDebugData = {
 };
 
 type GenerateResponse = {
+  status: "ok" | "no_route";
+  requestId: string;
   selectedRouteId: string | null;
   routes: GeneratedRoute[];
   explanation: {
@@ -73,6 +79,7 @@ type GenerateResponse = {
   };
   routeExplanations?: Array<{
     routeId: string;
+    theme?: string | null;
     summary: string;
     reasons: string[];
     locations: string[];
@@ -104,17 +111,6 @@ type GeoOrigin = {
   accuracy: number;
 };
 
-type PlaceSuggestion = {
-  id: string;
-  label: string;
-  fullLabel: string;
-  location: {
-    lat: number;
-    lng: number;
-    label?: string | null;
-  };
-};
-
 type WaypointDraft = {
   searchText: string;
   label: string;
@@ -126,22 +122,18 @@ const STORAGE_KEY = "scenicai.session";
 const ORIGIN_STORAGE_KEY = "scenicai.origin";
 const STOPS_STORAGE_KEY = "scenicai.stops";
 
-const defaultPreferences: Preferences = {
-  nature: true,
-  water: false,
-  historic: false,
-  quiet: false,
-  viewpoints: false,
-  culture: false,
-  cafes: false,
+const defaultState: SessionState = {
+  schemaVersion: 4,
+  durationMinutes: 45,
+  customDuration: false,
+  avoidBusyRoads: false,
+  refineText: "",
 };
 
-const defaultState: SessionState = {
-  schemaVersion: 2,
-  durationMinutes: 45,
-  preferences: defaultPreferences,
-  refineText: "",
-  includeMustSees: false,
+const THEME_LABELS: Record<string, string> = {
+  must_see: "Must-See Highlights",
+  cafes_culture: "Cafes & Culture",
+  views_nature: "Views & Nature",
 };
 
 const MIN_SIDEBAR_WIDTH = 280;
@@ -203,28 +195,6 @@ export function ScenicPlannerShell() {
   const [isStorageReady, setIsStorageReady] = useState(false);
   const [status, setStatus] = useState<"idle" | "generating" | "refining">("idle");
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
-  const [originLat, setOriginLat] = useState("");
-  const [originLng, setOriginLng] = useState("");
-  const [originLabel, setOriginLabel] = useState("");
-  const [originSearchText, setOriginSearchText] = useState("");
-  const [originSuggestions, setOriginSuggestions] = useState<PlaceSuggestion[]>([]);
-  const [isOriginSearchLoading, setIsOriginSearchLoading] = useState(false);
-  const [showOriginSuggestions, setShowOriginSuggestions] = useState(false);
-  const [activeOriginSuggestionIndex, setActiveOriginSuggestionIndex] = useState(-1);
-  const [originSearchError, setOriginSearchError] = useState<string | null>(null);
-  const originSearchAbortRef = useRef<AbortController | null>(null);
-  const originSearchDebounceRef = useRef<number | null>(null);
-  const [destinationLat, setDestinationLat] = useState("");
-  const [destinationLng, setDestinationLng] = useState("");
-  const [destinationLabel, setDestinationLabel] = useState("");
-  const [destinationSearchText, setDestinationSearchText] = useState("");
-  const [destinationSuggestions, setDestinationSuggestions] = useState<PlaceSuggestion[]>([]);
-  const [isDestinationSearchLoading, setIsDestinationSearchLoading] = useState(false);
-  const [showDestinationSuggestions, setShowDestinationSuggestions] = useState(false);
-  const [activeDestinationSuggestionIndex, setActiveDestinationSuggestionIndex] = useState(-1);
-  const [destinationSearchError, setDestinationSearchError] = useState<string | null>(null);
-  const destinationSearchAbortRef = useRef<AbortController | null>(null);
-  const destinationSearchDebounceRef = useRef<number | null>(null);
   const [waypoints, setWaypoints] = useState<WaypointDraft[]>([]);
   const [activeWaypointIndex, setActiveWaypointIndex] = useState<number | null>(null);
   const [waypointSuggestions, setWaypointSuggestions] = useState<PlaceSuggestion[]>([]);
@@ -242,6 +212,7 @@ export function ScenicPlannerShell() {
   const [scenicScore, setScenicScore] = useState<number | null>(null);
   const [generatedRoutes, setGeneratedRoutes] = useState<GeneratedRoute[]>([]);
   const [activeRouteId, setActiveRouteId] = useState<string | null>(null);
+  const [routeThemeById, setRouteThemeById] = useState<Record<string, string>>({});
   const [routeExplanationById, setRouteExplanationById] = useState<
     Record<string, { summary: string; reasons: string[]; locations: string[] }>
   >({});
@@ -254,8 +225,51 @@ export function ScenicPlannerShell() {
   const debugHoverClearTimeoutRef = useRef<number | null>(null);
   const [selectedRouteCoordinates, setSelectedRouteCoordinates] = useState<number[][] | null>(null);
   const [mapCenter, setMapCenter] = useState<[number, number]>([-0.1278, 51.5074]);
+  const [sidebarTab, setSidebarTab] = useState<"plan" | "results">("plan");
 
-  const { durationMinutes, preferences, refineText, includeMustSees } = sessionState;
+  const originSearch = useLocationSearch({
+    backendBaseUrl,
+    proximity: mapCenter,
+    debounceMs: ORIGIN_SEARCH_DEBOUNCE_MS,
+    unavailableMessage: "Location search unavailable. You can still enter coordinates below.",
+  });
+
+  const destinationSearch = useLocationSearch({
+    backendBaseUrl,
+    proximity: mapCenter,
+    debounceMs: ORIGIN_SEARCH_DEBOUNCE_MS,
+    unavailableMessage: "Destination search unavailable right now.",
+  });
+
+  const showDebug = useMemo(() => {
+    if (typeof window === "undefined") {
+      return false;
+    }
+    return new URLSearchParams(window.location.search).has("debug");
+  }, []);
+
+  const { durationMinutes, customDuration, avoidBusyRoads, refineText } =
+    sessionState;
+
+  const originLat = originSearch.lat;
+  const originLng = originSearch.lng;
+  const originLabel = originSearch.label;
+  const originSearchText = originSearch.searchText;
+  const originSuggestions = originSearch.suggestions;
+  const isOriginSearchLoading = originSearch.isLoading;
+  const showOriginSuggestions = originSearch.showSuggestions;
+  const activeOriginSuggestionIndex = originSearch.activeSuggestionIndex;
+  const originSearchError = originSearch.error;
+
+  const destinationLat = destinationSearch.lat;
+  const destinationLng = destinationSearch.lng;
+  const destinationLabel = destinationSearch.label;
+  const destinationSearchText = destinationSearch.searchText;
+  const destinationSuggestions = destinationSearch.suggestions;
+  const isDestinationSearchLoading = destinationSearch.isLoading;
+  const showDestinationSuggestions = destinationSearch.showSuggestions;
+  const activeDestinationSuggestionIndex = destinationSearch.activeSuggestionIndex;
+  const destinationSearchError = destinationSearch.error;
 
   useEffect(() => {
     const raw = window.localStorage.getItem(STORAGE_KEY);
@@ -266,23 +280,13 @@ export function ScenicPlannerShell() {
 
     try {
       const parsed = JSON.parse(raw) as SessionState | LegacySessionState;
-      if (parsed.schemaVersion === 2) {
-        setSessionState({
-          ...parsed,
-          preferences: { ...defaultPreferences, ...parsed.preferences },
-          includeMustSees: typeof parsed.includeMustSees === "boolean" ? parsed.includeMustSees : false,
-        });
-      } else if (parsed.schemaVersion === 1) {
-        setSessionState({
-          schemaVersion: 2,
-          durationMinutes: parsed.durationMinutes,
-          preferences: { ...defaultPreferences, ...parsed.preferences },
-          refineText: parsed.refineText,
-          includeMustSees: false,
-        });
-      } else {
-        window.localStorage.removeItem(STORAGE_KEY);
-      }
+      setSessionState({
+        schemaVersion: 4,
+        durationMinutes: typeof parsed.durationMinutes === "number" ? parsed.durationMinutes : 45,
+        customDuration: typeof parsed.customDuration === "boolean" ? parsed.customDuration : false,
+        avoidBusyRoads: typeof parsed.avoidBusyRoads === "boolean" ? parsed.avoidBusyRoads : false,
+        refineText: typeof parsed.refineText === "string" ? parsed.refineText : "",
+      });
     } catch {
       window.localStorage.removeItem(STORAGE_KEY);
     } finally {
@@ -306,15 +310,15 @@ export function ScenicPlannerShell() {
 
     try {
       const parsed = JSON.parse(raw) as { lat?: string; lng?: string; label?: string };
-      setOriginLat(typeof parsed.lat === "string" ? parsed.lat : "");
-      setOriginLng(typeof parsed.lng === "string" ? parsed.lng : "");
+      originSearch.setLat(typeof parsed.lat === "string" ? parsed.lat : "");
+      originSearch.setLng(typeof parsed.lng === "string" ? parsed.lng : "");
       const label = typeof parsed.label === "string" ? parsed.label : "";
-      setOriginLabel(label);
-      setOriginSearchText(label);
+      originSearch.setLabel(label);
+      originSearch.setSearchText(label);
     } catch {
       window.localStorage.removeItem(ORIGIN_STORAGE_KEY);
     }
-  }, []);
+  }, [originSearch.setLabel, originSearch.setLat, originSearch.setLng, originSearch.setSearchText]);
 
   useEffect(() => {
     const raw = window.localStorage.getItem(STOPS_STORAGE_KEY);
@@ -330,11 +334,11 @@ export function ScenicPlannerShell() {
 
       const destination = parsed.destination;
       if (destination) {
-        setDestinationLat(typeof destination.lat === "string" ? destination.lat : "");
-        setDestinationLng(typeof destination.lng === "string" ? destination.lng : "");
+        destinationSearch.setLat(typeof destination.lat === "string" ? destination.lat : "");
+        destinationSearch.setLng(typeof destination.lng === "string" ? destination.lng : "");
         const destinationText = typeof destination.label === "string" ? destination.label : "";
-        setDestinationLabel(destinationText);
-        setDestinationSearchText(destinationText);
+        destinationSearch.setLabel(destinationText);
+        destinationSearch.setSearchText(destinationText);
       }
 
       const parsedWaypoints = Array.isArray(parsed.waypoints) ? parsed.waypoints : [];
@@ -342,7 +346,7 @@ export function ScenicPlannerShell() {
     } catch {
       window.localStorage.removeItem(STOPS_STORAGE_KEY);
     }
-  }, []);
+  }, [destinationSearch.setLabel, destinationSearch.setLat, destinationSearch.setLng, destinationSearch.setSearchText]);
 
   useEffect(() => {
     window.localStorage.setItem(
@@ -350,10 +354,10 @@ export function ScenicPlannerShell() {
       JSON.stringify({
         lat: originLat,
         lng: originLng,
-        label: originLabel,
+        label: originSearch.label,
       }),
     );
-  }, [originLabel, originLat, originLng]);
+  }, [originSearch.label, originLat, originLng]);
 
   useEffect(() => {
     window.localStorage.setItem(
@@ -362,23 +366,15 @@ export function ScenicPlannerShell() {
         destination: {
           lat: destinationLat,
           lng: destinationLng,
-          label: destinationLabel,
+          label: destinationSearch.label,
         },
         waypoints,
       }),
     );
-  }, [destinationLabel, destinationLat, destinationLng, waypoints]);
+  }, [destinationSearch.label, destinationLat, destinationLng, waypoints]);
 
   useEffect(() => {
     return () => {
-      if (originSearchDebounceRef.current !== null) {
-        window.clearTimeout(originSearchDebounceRef.current);
-      }
-      originSearchAbortRef.current?.abort();
-      if (destinationSearchDebounceRef.current !== null) {
-        window.clearTimeout(destinationSearchDebounceRef.current);
-      }
-      destinationSearchAbortRef.current?.abort();
       if (waypointSearchDebounceRef.current !== null) {
         window.clearTimeout(waypointSearchDebounceRef.current);
       }
@@ -389,104 +385,6 @@ export function ScenicPlannerShell() {
       }
     };
   }, []);
-
-  const fetchOriginSuggestions = useCallback(
-    async (query: string) => {
-      originSearchAbortRef.current?.abort();
-      const controller = new AbortController();
-      originSearchAbortRef.current = controller;
-
-      setIsOriginSearchLoading(true);
-      setOriginSearchError(null);
-
-      try {
-        const response = await fetch(`${backendBaseUrl}/api/v1/location/search`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            query,
-            limit: 6,
-            proximityLat: mapCenter[1],
-            proximityLng: mapCenter[0],
-          }),
-          signal: controller.signal,
-        });
-
-        if (!response.ok) {
-          const detail = await extractBackendErrorDetail(response);
-          throw new Error(detail || `Location search failed (${response.status})`);
-        }
-
-        const payload = (await response.json()) as { results?: PlaceSuggestion[] };
-        const nextSuggestions = Array.isArray(payload.results) ? payload.results : [];
-        setOriginSuggestions(nextSuggestions);
-        setShowOriginSuggestions(true);
-        setActiveOriginSuggestionIndex(nextSuggestions.length > 0 ? 0 : -1);
-      } catch (error) {
-        if (error instanceof DOMException && error.name === "AbortError") {
-          return;
-        }
-        setOriginSuggestions([]);
-        setActiveOriginSuggestionIndex(-1);
-        setOriginSearchError(
-          error instanceof Error
-            ? error.message
-            : "Location search unavailable. You can still enter coordinates below.",
-        );
-      } finally {
-        setIsOriginSearchLoading(false);
-      }
-    },
-    [backendBaseUrl, mapCenter],
-  );
-
-  const fetchDestinationSuggestions = useCallback(
-    async (query: string) => {
-      destinationSearchAbortRef.current?.abort();
-      const controller = new AbortController();
-      destinationSearchAbortRef.current = controller;
-
-      setIsDestinationSearchLoading(true);
-      setDestinationSearchError(null);
-
-      try {
-        const response = await fetch(`${backendBaseUrl}/api/v1/location/search`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            query,
-            limit: 6,
-            proximityLat: mapCenter[1],
-            proximityLng: mapCenter[0],
-          }),
-          signal: controller.signal,
-        });
-
-        if (!response.ok) {
-          const detail = await extractBackendErrorDetail(response);
-          throw new Error(detail || `Location search failed (${response.status})`);
-        }
-
-        const payload = (await response.json()) as { results?: PlaceSuggestion[] };
-        const nextSuggestions = Array.isArray(payload.results) ? payload.results : [];
-        setDestinationSuggestions(nextSuggestions);
-        setShowDestinationSuggestions(true);
-        setActiveDestinationSuggestionIndex(nextSuggestions.length > 0 ? 0 : -1);
-      } catch (error) {
-        if (error instanceof DOMException && error.name === "AbortError") {
-          return;
-        }
-        setDestinationSuggestions([]);
-        setActiveDestinationSuggestionIndex(-1);
-        setDestinationSearchError(
-          error instanceof Error ? error.message : "Destination search unavailable right now.",
-        );
-      } finally {
-        setIsDestinationSearchLoading(false);
-      }
-    },
-    [backendBaseUrl, mapCenter],
-  );
 
   const fetchWaypointSuggestions = useCallback(
     async (query: string) => {
@@ -557,64 +455,14 @@ export function ScenicPlannerShell() {
           return;
         }
 
-        setOriginLabel(top.fullLabel);
-        setOriginSearchText(top.fullLabel);
+        originSearch.setLabel(top.fullLabel);
+        originSearch.setSearchText(top.fullLabel);
       } catch {
         // Non-blocking fallback.
       }
     },
-    [backendBaseUrl],
+    [backendBaseUrl, originSearch.setLabel, originSearch.setSearchText],
   );
-
-  useEffect(() => {
-    const query = originSearchText.trim();
-    if (!query || query.length < 2 || query === originLabel) {
-      setOriginSuggestions([]);
-      setShowOriginSuggestions(false);
-      setIsOriginSearchLoading(false);
-      setOriginSearchError(null);
-      return;
-    }
-
-    if (originSearchDebounceRef.current !== null) {
-      window.clearTimeout(originSearchDebounceRef.current);
-    }
-
-    originSearchDebounceRef.current = window.setTimeout(() => {
-      fetchOriginSuggestions(query);
-    }, ORIGIN_SEARCH_DEBOUNCE_MS);
-
-    return () => {
-      if (originSearchDebounceRef.current !== null) {
-        window.clearTimeout(originSearchDebounceRef.current);
-      }
-    };
-  }, [fetchOriginSuggestions, originLabel, originSearchText]);
-
-  useEffect(() => {
-    const query = destinationSearchText.trim();
-    if (!query || query.length < 2 || query === destinationLabel) {
-      setDestinationSuggestions([]);
-      setShowDestinationSuggestions(false);
-      setIsDestinationSearchLoading(false);
-      setDestinationSearchError(null);
-      return;
-    }
-
-    if (destinationSearchDebounceRef.current !== null) {
-      window.clearTimeout(destinationSearchDebounceRef.current);
-    }
-
-    destinationSearchDebounceRef.current = window.setTimeout(() => {
-      fetchDestinationSuggestions(query);
-    }, ORIGIN_SEARCH_DEBOUNCE_MS);
-
-    return () => {
-      if (destinationSearchDebounceRef.current !== null) {
-        window.clearTimeout(destinationSearchDebounceRef.current);
-      }
-    };
-  }, [destinationLabel, destinationSearchText, fetchDestinationSuggestions]);
 
   useEffect(() => {
     if (activeWaypointIndex === null) {
@@ -648,7 +496,7 @@ export function ScenicPlannerShell() {
   }, [activeWaypointIndex, fetchWaypointSuggestions, waypoints]);
 
   useEffect(() => {
-    if (originLabel) {
+    if (originSearch.label) {
       return;
     }
 
@@ -659,12 +507,7 @@ export function ScenicPlannerShell() {
     }
 
     void reverseGeocodeOrigin(latValue, lngValue);
-  }, [originLabel, originLat, originLng, reverseGeocodeOrigin]);
-
-  const selectedPreferences = useMemo(
-    () => Object.entries(preferences).filter(([, enabled]) => enabled).map(([key]) => key),
-    [preferences],
-  );
+  }, [originSearch.label, originLat, originLng, reverseGeocodeOrigin]);
 
   const resolveManualOrigin = (): { lat: number; lng: number } | null => {
     const latText = originLat.trim();
@@ -770,16 +613,6 @@ export function ScenicPlannerShell() {
     return resolveBrowserGeolocation(true);
   };
 
-  const toPreferenceWeights = () => ({
-    nature: preferences.nature ? 1 : 0,
-    water: preferences.water ? 1 : 0,
-    historic: preferences.historic ? 1 : 0,
-    quiet: preferences.quiet ? 1 : 0,
-    viewpoints: preferences.viewpoints ? 1 : 0,
-    culture: preferences.culture ? 1 : 0,
-    cafes: preferences.cafes ? 1 : 0,
-  });
-
   const preferenceButtonOrder: PreferenceKey[] = [
     "nature",
     "water",
@@ -790,7 +623,7 @@ export function ScenicPlannerShell() {
     "cafes",
   ];
 
-  const preferenceLabels: Record<PreferenceKey, string> = {
+  const debugTagLabels: Record<PreferenceKey | "busyRoad", string> = {
     nature: "Nature",
     water: "Water",
     historic: "Historic",
@@ -798,33 +631,34 @@ export function ScenicPlannerShell() {
     viewpoints: "Viewpoints",
     culture: "Culture",
     cafes: "Cafes",
-  };
-
-  const debugTagLabels: Record<PreferenceKey | "busyRoad", string> = {
-    ...preferenceLabels,
     busyRoad: "Busy Roads",
   };
 
   const applySelectedRouteView = (
     route: GeneratedRoute,
     origin: { lat: number; lng: number },
-    explanationFallback: { summary: string; reasons: string[] },
-    availableRoutes: GeneratedRoute[] = generatedRoutes,
-    explanations: Record<string, { summary: string; reasons: string[]; locations: string[] }> = routeExplanationById,
+    currentExplanationById: Record<string, { summary: string; reasons: string[]; locations: string[] }> = routeExplanationById,
+    currentThemeById: Record<string, string> = routeThemeById,
   ) => {
     const distanceKm = (route.distanceMeters / 1000).toFixed(1);
     const minutes = Math.round(route.durationSeconds / 60);
-    const routeIndex = availableRoutes.findIndex((candidate) => candidate.id === route.id);
-    const explanationForRoute = explanations[route.id];
+    const theme = currentThemeById[route.id];
+    const themeLabel = theme ? THEME_LABELS[theme] ?? "Scenic Route" : "Scenic Route";
 
-    setRouteTitle(
-      routeIndex >= 0 ? `Route #${routeIndex + 1}` : `Route ${route.id.replace("route_", "#")}`,
-    );
+    setRouteTitle(themeLabel);
     setRouteMeta(`${distanceKm} km ・ ${minutes} min walk`);
     setScenicScore(route.scenicScore);
-    setExplanationText(explanationForRoute?.summary || explanationFallback.summary);
+    if (customDuration && destinationSearch.searchText.trim() && minutes > durationMinutes * 1.5) {
+      setLocationNote(
+        `The destination requires a longer walk (~${minutes} min) than your ${durationMinutes} min target.`,
+      );
+    }
+    const routeExplanation = currentExplanationById[route.id];
+    if (routeExplanation?.summary) {
+      setExplanationText(routeExplanation.summary);
+    }
     setSelectedRouteDebug(route.scoreDebug ?? null);
-    setActiveDebugTag(preferenceButtonOrder.find((key) => preferences[key]) ?? "nature");
+    setActiveDebugTag("nature");
     if (debugHoverClearTimeoutRef.current !== null) {
       window.clearTimeout(debugHoverClearTimeoutRef.current);
       debugHoverClearTimeoutRef.current = null;
@@ -852,10 +686,12 @@ export function ScenicPlannerShell() {
     if (payload.routes.length === 0 || payload.selectedRouteId === null) {
       setExplanationText(payload.explanation.summary);
       setRequestError(fallbackNoRouteMessage);
+      setSidebarTab("results");
       setSelectedRouteDebug(null);
       setGeneratedRoutes([]);
       setActiveRouteId(null);
       setRouteExplanationById({});
+      setRouteThemeById({});
       setSelectedRouteCoordinates(null);
       if (debugHoverClearTimeoutRef.current !== null) {
         window.clearTimeout(debugHoverClearTimeoutRef.current);
@@ -879,8 +715,23 @@ export function ScenicPlannerShell() {
     }, {});
     setRouteExplanationById(explanationMap);
 
+    const themeMap = explanationEntries.reduce<Record<string, string>>((acc, item) => {
+      if (item.theme) {
+        acc[item.routeId] = item.theme;
+      }
+      return acc;
+    }, {});
+    setRouteThemeById(themeMap);
+
     const selected = payload.routes.find((route) => route.id === payload.selectedRouteId) ?? payload.routes[0];
-    applySelectedRouteView(selected, origin, payload.explanation, payload.routes, explanationMap);
+    const selectedExplanation = explanationMap[selected.id];
+    if (selectedExplanation?.summary) {
+      setExplanationText(selectedExplanation.summary);
+    } else {
+      setExplanationText(payload.explanation.summary);
+    }
+    applySelectedRouteView(selected, origin, explanationMap, themeMap);
+    setSidebarTab("results");
   };
 
   const handleRouteSelect = (routeId: string) => {
@@ -890,31 +741,14 @@ export function ScenicPlannerShell() {
     if (!selected) {
       return;
     }
-    applySelectedRouteView(selected, fallbackOrigin, {
-      summary: explanationText,
-      reasons: [],
-    });
+    applySelectedRouteView(selected, fallbackOrigin);
   };
 
   const debugMatches = selectedRouteDebug?.tagObjectMatches?.[activeDebugTag] ?? [];
   const poiContextFetchFailed = selectedRouteDebug?.poiContextFetchFailed === true;
-  const activeRouteExplanation = activeRouteId ? routeExplanationById[activeRouteId] : undefined;
-
-  const togglePreference = (key: PreferenceKey) => {
-    setSessionState((prev) => ({
-      ...prev,
-      preferences: { ...prev.preferences, [key]: !prev.preferences[key] },
-    }));
-  };
 
   const applyOriginSuggestion = (suggestion: PlaceSuggestion) => {
-    setOriginLat(suggestion.location.lat.toFixed(5));
-    setOriginLng(suggestion.location.lng.toFixed(5));
-    setOriginLabel(suggestion.fullLabel);
-    setOriginSearchText(suggestion.fullLabel);
-    setOriginSuggestions([]);
-    setShowOriginSuggestions(false);
-    setActiveOriginSuggestionIndex(-1);
+    originSearch.applySuggestion(suggestion);
     setMapCenter([suggestion.location.lng, suggestion.location.lat]);
   };
 
@@ -922,26 +756,18 @@ export function ScenicPlannerShell() {
     const latText = coordinate.lat.toFixed(5);
     const lngText = coordinate.lng.toFixed(5);
 
-    setOriginLat(latText);
-    setOriginLng(lngText);
-    setOriginLabel("");
-    setOriginSearchText(`${latText}, ${lngText}`);
-    setOriginSearchError(null);
-    setOriginSuggestions([]);
-    setShowOriginSuggestions(false);
-    setActiveOriginSuggestionIndex(-1);
+    originSearch.setLat(latText);
+    originSearch.setLng(lngText);
+    originSearch.setLabel("");
+    originSearch.setSearchText(`${latText}, ${lngText}`);
+    originSearch.clearError();
+    originSearch.clearSuggestions();
     setLocationNote("Starting point set from map pin.");
     setMapCenter([coordinate.lng, coordinate.lat]);
-  }, []);
+  }, [originSearch]);
 
   const applyDestinationSuggestion = (suggestion: PlaceSuggestion) => {
-    setDestinationLat(suggestion.location.lat.toFixed(5));
-    setDestinationLng(suggestion.location.lng.toFixed(5));
-    setDestinationLabel(suggestion.fullLabel);
-    setDestinationSearchText(suggestion.fullLabel);
-    setDestinationSuggestions([]);
-    setShowDestinationSuggestions(false);
-    setActiveDestinationSuggestionIndex(-1);
+    destinationSearch.applySuggestion(suggestion);
   };
 
   const addWaypoint = () => {
@@ -1027,7 +853,7 @@ export function ScenicPlannerShell() {
   };
 
   const toStopsPayload = () => {
-    const destination = normalizeStop(destinationLat, destinationLng, destinationLabel || destinationSearchText);
+    const destination = normalizeStop(destinationLat, destinationLng, destinationSearch.label || destinationSearch.searchText);
 
     const waypointPayload = waypoints
       .map((waypoint) => normalizeStop(waypoint.lat, waypoint.lng, waypoint.label || waypoint.searchText))
@@ -1038,70 +864,11 @@ export function ScenicPlannerShell() {
   };
 
   const handleOriginSearchKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
-    if (event.key === "ArrowDown") {
-      event.preventDefault();
-      if (!showOriginSuggestions && originSuggestions.length > 0) {
-        setShowOriginSuggestions(true);
-      }
-      setActiveOriginSuggestionIndex((prev) =>
-        originSuggestions.length === 0 ? -1 : Math.min(prev + 1, originSuggestions.length - 1),
-      );
-      return;
-    }
-
-    if (event.key === "ArrowUp") {
-      event.preventDefault();
-      setActiveOriginSuggestionIndex((prev) => (originSuggestions.length === 0 ? -1 : Math.max(prev - 1, 0)));
-      return;
-    }
-
-    if (event.key === "Enter") {
-      if (showOriginSuggestions && activeOriginSuggestionIndex >= 0 && originSuggestions[activeOriginSuggestionIndex]) {
-        event.preventDefault();
-        applyOriginSuggestion(originSuggestions[activeOriginSuggestionIndex]);
-      }
-      return;
-    }
-
-    if (event.key === "Escape") {
-      setShowOriginSuggestions(false);
-    }
+    originSearch.handleKeyDown(event, applyOriginSuggestion);
   };
 
   const handleDestinationSearchKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
-    if (event.key === "ArrowDown") {
-      event.preventDefault();
-      if (!showDestinationSuggestions && destinationSuggestions.length > 0) {
-        setShowDestinationSuggestions(true);
-      }
-      setActiveDestinationSuggestionIndex((prev) =>
-        destinationSuggestions.length === 0 ? -1 : Math.min(prev + 1, destinationSuggestions.length - 1),
-      );
-      return;
-    }
-
-    if (event.key === "ArrowUp") {
-      event.preventDefault();
-      setActiveDestinationSuggestionIndex((prev) =>
-        destinationSuggestions.length === 0 ? -1 : Math.max(prev - 1, 0),
-      );
-      return;
-    }
-
-    if (
-      event.key === "Enter" &&
-      showDestinationSuggestions &&
-      activeDestinationSuggestionIndex >= 0 &&
-      destinationSuggestions[activeDestinationSuggestionIndex]
-    ) {
-      event.preventDefault();
-      applyDestinationSuggestion(destinationSuggestions[activeDestinationSuggestionIndex]);
-      return;
-    }
-
-    if (event.key === "Escape") {
-      setShowDestinationSuggestions(false);
-    }
+    destinationSearch.handleKeyDown(event, applyDestinationSuggestion);
   };
 
   const handleWaypointSearchKeyDown = (event: React.KeyboardEvent<HTMLInputElement>, index: number) => {
@@ -1158,7 +925,7 @@ export function ScenicPlannerShell() {
     }
 
     const stopsPayload = toStopsPayload();
-    if (destinationSearchText.trim() && !stopsPayload.destination) {
+    if (destinationSearch.searchText.trim() && !stopsPayload.destination) {
       setStatus("idle");
       setRequestError("Pick a destination from suggestions, or clear destination text.");
       return;
@@ -1172,9 +939,9 @@ export function ScenicPlannerShell() {
           origin,
           destination: stopsPayload.destination,
           waypoints: stopsPayload.waypoints,
-          durationMinutes,
-          preferences: toPreferenceWeights(),
-          constraints: { avoidBusyRoads: preferences.quiet, includeMustSees },
+          durationMinutes: customDuration ? durationMinutes : undefined,
+          preferences: { nature: 1, water: 1, historic: 1, quiet: 1, viewpoints: 1, culture: 1, cafes: 1 },
+          constraints: { avoidBusyRoads, includeMustSees: true },
           sessionId: "anon-web-session",
           refinementText: refineText || undefined,
         }),
@@ -1231,12 +998,13 @@ export function ScenicPlannerShell() {
         body: JSON.stringify({
           sessionId: "anon-web-session",
           message,
+          activeRouteId,
           origin,
           destination: stopsPayload.destination,
           waypoints: stopsPayload.waypoints,
-          durationMinutes,
-          preferences: toPreferenceWeights(),
-          constraints: { avoidBusyRoads: preferences.quiet, includeMustSees },
+          durationMinutes: customDuration ? durationMinutes : undefined,
+          preferences: { nature: 1, water: 1, historic: 1, quiet: 1, viewpoints: 1, culture: 1, cafes: 1 },
+          constraints: { avoidBusyRoads, includeMustSees: true },
         }),
       });
 
@@ -1282,8 +1050,8 @@ export function ScenicPlannerShell() {
       setLocationNote(`Location locked (~${Math.round(origin.accuracy)}m accuracy).`);
     }
 
-    setOriginLat(origin.lat.toFixed(5));
-    setOriginLng(origin.lng.toFixed(5));
+    originSearch.setLat(origin.lat.toFixed(5));
+    originSearch.setLng(origin.lng.toFixed(5));
     void reverseGeocodeOrigin(origin.lat, origin.lng);
     setMapCenter([origin.lng, origin.lat]);
   };
@@ -1356,231 +1124,78 @@ export function ScenicPlannerShell() {
             <span className="text-lg font-medium">ScenicAI</span>
           </div>
 
-          <div className="mt-10 space-y-6">
-            <section>
-              <p className="text-sm font-medium">Starting Point</p>
-              <p className="mt-1 text-xs text-app-muted">Click the map to drop a pin and use it as your start.</p>
-              <div className="relative mt-3">
-                <input
-                  value={originSearchText}
-                  onChange={(event) => {
-                    const value = event.target.value;
-                    setOriginSearchText(value);
-                    setOriginLabel("");
-                    setOriginLat("");
-                    setOriginLng("");
-                    setOriginSearchError(null);
-                    setShowOriginSuggestions(true);
-                  }}
-                  onFocus={() => {
-                    if (originSuggestions.length > 0) {
-                      setShowOriginSuggestions(true);
-                    }
-                  }}
-                  onBlur={() => {
-                    window.setTimeout(() => {
-                      setShowOriginSuggestions(false);
-                    }, 120);
-                  }}
-                  onKeyDown={handleOriginSearchKeyDown}
-                  placeholder="Search address, place, or landmark"
-                  className="h-9 w-full rounded-xl border border-panel-border bg-white px-3 text-sm"
-                  aria-label="Search starting location"
-                  aria-autocomplete="list"
-                />
-                {showOriginSuggestions && (isOriginSearchLoading || originSuggestions.length > 0) ? (
-                  <div className="absolute z-20 mt-1 w-full rounded-xl border border-panel-border bg-white p-1 shadow-sm">
-                    {isOriginSearchLoading ? (
-                      <p className="px-2 py-1 text-xs text-app-muted">Searching...</p>
-                    ) : (
-                      <ul role="listbox" className="max-h-44 overflow-auto">
-                        {originSuggestions.map((suggestion, index) => (
-                          <li key={suggestion.id}>
-                            <button
-                              type="button"
-                              onMouseDown={(event) => {
-                                event.preventDefault();
-                                applyOriginSuggestion(suggestion);
-                              }}
-                              className={`w-full rounded-lg px-2 py-2 text-left text-xs ${
-                                index === activeOriginSuggestionIndex ? "bg-accent/10 text-app-foreground" : "text-app-muted"
-                              }`}
-                            >
-                              <p className="font-medium text-app-foreground">{suggestion.label}</p>
-                              <p>{suggestion.fullLabel}</p>
-                            </button>
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-                ) : null}
-              </div>
-              {originSearchError ? <p className="mt-1 text-xs text-amber-700">{originSearchError}</p> : null}
-              <details className="mt-2 rounded-xl border border-panel-border bg-white p-2">
-                <summary className="cursor-pointer text-xs text-app-muted">Enter coordinates manually</summary>
-                <div className="mt-2 grid grid-cols-2 gap-2">
-                  <input
-                    value={originLat}
-                    onChange={(event) => {
-                      setOriginLat(event.target.value);
-                      setOriginLabel("");
-                    }}
-                    placeholder="Latitude"
-                    className="h-9 rounded-xl border border-panel-border bg-white px-3 text-sm"
-                  />
-                  <input
-                    value={originLng}
-                    onChange={(event) => {
-                      setOriginLng(event.target.value);
-                      setOriginLabel("");
-                    }}
-                    placeholder="Longitude"
-                    className="h-9 rounded-xl border border-panel-border bg-white px-3 text-sm"
-                  />
-                </div>
-              </details>
+          <div className="mt-8 space-y-4">
+            <div className="grid grid-cols-2 gap-2 rounded-xl border border-panel-border bg-white p-1">
               <button
                 type="button"
-                onClick={handleUseMyLocation}
-                className="mt-2 h-8 w-full rounded-lg border border-panel-border bg-white text-xs"
+                onClick={() => setSidebarTab("plan")}
+                className={`h-8 rounded-lg text-sm font-medium transition ${
+                  sidebarTab === "plan" ? "bg-app-foreground text-panel" : "text-app-muted"
+                }`}
               >
-                Use my location
+                Plan
               </button>
-            </section>
+              <button
+                type="button"
+                onClick={() => setSidebarTab("results")}
+                disabled={generatedRoutes.length === 0 && !requestError && !aiRouteNote}
+                className={`h-8 rounded-lg text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                  sidebarTab === "results" ? "bg-app-foreground text-panel" : "text-app-muted"
+                }`}
+              >
+                Results
+              </button>
+            </div>
 
-            <section>
-              <p className="text-sm font-medium">Destination (Optional)</p>
-              <div className="relative mt-3">
-                <input
-                  value={destinationSearchText}
-                  onChange={(event) => {
-                    const value = event.target.value;
-                    setDestinationSearchText(value);
-                    setDestinationLabel("");
-                    setDestinationLat("");
-                    setDestinationLng("");
-                    setDestinationSearchError(null);
-                    setShowDestinationSuggestions(true);
-                  }}
-                  onFocus={() => {
-                    if (destinationSuggestions.length > 0) {
-                      setShowDestinationSuggestions(true);
-                    }
-                  }}
-                  onBlur={() => {
-                    window.setTimeout(() => {
-                      setShowDestinationSuggestions(false);
-                    }, 120);
-                  }}
-                  onKeyDown={handleDestinationSearchKeyDown}
-                  placeholder="Search destination"
-                  className="h-9 w-full rounded-xl border border-panel-border bg-white px-3 text-sm"
-                  aria-label="Search destination"
-                  aria-autocomplete="list"
-                />
-                {showDestinationSuggestions && (isDestinationSearchLoading || destinationSuggestions.length > 0) ? (
-                  <div className="absolute z-20 mt-1 w-full rounded-xl border border-panel-border bg-white p-1 shadow-sm">
-                    {isDestinationSearchLoading ? (
-                      <p className="px-2 py-1 text-xs text-app-muted">Searching...</p>
-                    ) : (
-                      <ul role="listbox" className="max-h-44 overflow-auto">
-                        {destinationSuggestions.map((suggestion, index) => (
-                          <li key={suggestion.id}>
-                            <button
-                              type="button"
-                              onMouseDown={(event) => {
-                                event.preventDefault();
-                                applyDestinationSuggestion(suggestion);
-                              }}
-                              className={`w-full rounded-lg px-2 py-2 text-left text-xs ${
-                                index === activeDestinationSuggestionIndex
-                                  ? "bg-accent/10 text-app-foreground"
-                                  : "text-app-muted"
-                              }`}
-                            >
-                              <p className="font-medium text-app-foreground">{suggestion.label}</p>
-                              <p>{suggestion.fullLabel}</p>
-                            </button>
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-                ) : null}
-              </div>
-              {destinationSearchError ? <p className="mt-1 text-xs text-amber-700">{destinationSearchError}</p> : null}
-            </section>
-
-            <section>
-              <div className="flex items-center justify-between">
-                <p className="text-sm font-medium">Waypoints (Optional)</p>
-                <button
-                  type="button"
-                  onClick={addWaypoint}
-                  disabled={waypoints.length >= MAX_WAYPOINTS}
-                  className="h-7 rounded-lg border border-panel-border bg-white px-2 text-xs disabled:opacity-50"
-                >
-                  Add waypoint
-                </button>
-              </div>
-              <div className="mt-3 space-y-2">
-                {waypoints.length === 0 ? (
-                  <p className="text-xs text-app-muted">Add up to 3 waypoint stops.</p>
-                ) : null}
-                {waypoints.map((waypoint, index) => (
-                  <div key={`waypoint-${index}`} className="relative rounded-xl border border-panel-border bg-white p-2">
-                    <div className="mb-2 flex items-center justify-between">
-                      <p className="text-xs font-medium text-app-muted">Waypoint {index + 1}</p>
-                      <button
-                        type="button"
-                        onClick={() => removeWaypoint(index)}
-                        className="text-xs text-app-muted hover:text-app-foreground"
-                      >
-                        Remove
-                      </button>
-                    </div>
+            {sidebarTab === "plan" ? (
+              <div className="space-y-6">
+                <section>
+                  <p className="text-sm font-medium">Starting Point</p>
+                  <p className="mt-1 text-xs text-app-muted">Click the map to drop a pin and use it as your start.</p>
+                  <div className="relative mt-3">
                     <input
-                      value={waypoint.searchText}
+                      value={originSearchText}
                       onChange={(event) => {
-                        updateWaypointSearchText(index, event.target.value);
-                        setWaypointSearchError(null);
-                        setActiveWaypointIndex(index);
-                        setShowWaypointSuggestions(true);
+                        const value = event.target.value;
+                        originSearch.setSearchText(value);
+                        originSearch.setLabel("");
+                        originSearch.setLat("");
+                        originSearch.setLng("");
+                        originSearch.setError(null);
+                        originSearch.setShowSuggestions(true);
                       }}
                       onFocus={() => {
-                        setActiveWaypointIndex(index);
-                        if (waypointSuggestions.length > 0) {
-                          setShowWaypointSuggestions(true);
+                        if (originSuggestions.length > 0) {
+                          originSearch.setShowSuggestions(true);
                         }
                       }}
                       onBlur={() => {
                         window.setTimeout(() => {
-                          setShowWaypointSuggestions(false);
+                          originSearch.setShowSuggestions(false);
                         }, 120);
                       }}
-                      onKeyDown={(event) => handleWaypointSearchKeyDown(event, index)}
-                      placeholder="Search waypoint"
-                      className="h-8 w-full rounded-lg border border-panel-border px-2 text-xs"
-                      aria-label={`Search waypoint ${index + 1}`}
+                      onKeyDown={handleOriginSearchKeyDown}
+                      placeholder="Search address, place, or landmark"
+                      className="h-9 w-full rounded-xl border border-panel-border bg-white px-3 text-sm"
+                      aria-label="Search starting location"
+                      aria-autocomplete="list"
                     />
-
-                    {activeWaypointIndex === index && showWaypointSuggestions && (isWaypointSearchLoading || waypointSuggestions.length > 0) ? (
-                      <div className="absolute left-2 right-2 top-[70px] z-20 rounded-xl border border-panel-border bg-white p-1 shadow-sm">
-                        {isWaypointSearchLoading ? (
+                    {showOriginSuggestions && (isOriginSearchLoading || originSuggestions.length > 0) ? (
+                      <div className="absolute z-20 mt-1 w-full rounded-xl border border-panel-border bg-white p-1 shadow-sm">
+                        {isOriginSearchLoading ? (
                           <p className="px-2 py-1 text-xs text-app-muted">Searching...</p>
                         ) : (
-                          <ul role="listbox" className="max-h-40 overflow-auto">
-                            {waypointSuggestions.map((suggestion, suggestionIndex) => (
+                          <ul role="listbox" className="max-h-44 overflow-auto">
+                            {originSuggestions.map((suggestion, index) => (
                               <li key={suggestion.id}>
                                 <button
                                   type="button"
                                   onMouseDown={(event) => {
                                     event.preventDefault();
-                                    applyWaypointSuggestion(index, suggestion);
+                                    applyOriginSuggestion(suggestion);
                                   }}
                                   className={`w-full rounded-lg px-2 py-2 text-left text-xs ${
-                                    suggestionIndex === activeWaypointSuggestionIndex
+                                    index === activeOriginSuggestionIndex
                                       ? "bg-accent/10 text-app-foreground"
                                       : "text-app-muted"
                                   }`}
@@ -1595,96 +1210,280 @@ export function ScenicPlannerShell() {
                       </div>
                     ) : null}
                   </div>
-                ))}
-              </div>
-              {waypointSearchError ? <p className="mt-1 text-xs text-amber-700">{waypointSearchError}</p> : null}
-            </section>
+                  {originSearchError ? <p className="mt-1 text-xs text-amber-700">{originSearchError}</p> : null}
+                  <details className="mt-2 rounded-xl border border-panel-border bg-white p-2">
+                    <summary className="cursor-pointer text-xs text-app-muted">Enter coordinates manually</summary>
+                    <div className="mt-2 grid grid-cols-2 gap-2">
+                      <input
+                        value={originLat}
+                        onChange={(event) => {
+                          originSearch.setLat(event.target.value);
+                          originSearch.setLabel("");
+                        }}
+                        placeholder="Latitude"
+                        className="h-9 rounded-xl border border-panel-border bg-white px-3 text-sm"
+                      />
+                      <input
+                        value={originLng}
+                        onChange={(event) => {
+                          originSearch.setLng(event.target.value);
+                          originSearch.setLabel("");
+                        }}
+                        placeholder="Longitude"
+                        className="h-9 rounded-xl border border-panel-border bg-white px-3 text-sm"
+                      />
+                    </div>
+                  </details>
+                  <button
+                    type="button"
+                    onClick={handleUseMyLocation}
+                    className="mt-2 h-8 w-full rounded-lg border border-panel-border bg-white text-xs"
+                  >
+                    Use my location
+                  </button>
+                </section>
 
-            <section>
-              <div className="flex items-center justify-between text-sm font-medium">
-                <span>Desired Duration</span>
-                <span className="text-accent">{durationMinutes} min</span>
-              </div>
-              <input
-                id="duration"
-                type="range"
-                min={15}
-                max={120}
-                step={5}
-                value={durationMinutes}
-                onChange={(event) =>
-                  setSessionState((prev) => ({
-                    ...prev,
-                    durationMinutes: Number(event.target.value),
-                  }))
-                }
-                className="mt-3 w-full accent-accent"
-              />
-              <div className="mt-2 flex justify-between text-xs text-app-muted">
-                <span>15m</span>
-                <span>1h</span>
-                <span>2h+</span>
-              </div>
-            </section>
+                <section>
+                  <p className="text-sm font-medium">Destination (Optional)</p>
+                  <div className="relative mt-3">
+                    <input
+                      value={destinationSearchText}
+                      onChange={(event) => {
+                        const value = event.target.value;
+                        destinationSearch.setSearchText(value);
+                        destinationSearch.setLabel("");
+                        destinationSearch.setLat("");
+                        destinationSearch.setLng("");
+                        destinationSearch.setError(null);
+                        destinationSearch.setShowSuggestions(true);
+                      }}
+                      onFocus={() => {
+                        if (destinationSuggestions.length > 0) {
+                          destinationSearch.setShowSuggestions(true);
+                        }
+                      }}
+                      onBlur={() => {
+                        window.setTimeout(() => {
+                          destinationSearch.setShowSuggestions(false);
+                        }, 120);
+                      }}
+                      onKeyDown={handleDestinationSearchKeyDown}
+                      placeholder="Search destination"
+                      className="h-9 w-full rounded-xl border border-panel-border bg-white px-3 text-sm"
+                      aria-label="Search destination"
+                      aria-autocomplete="list"
+                    />
+                    {showDestinationSuggestions && (isDestinationSearchLoading || destinationSuggestions.length > 0) ? (
+                      <div className="absolute z-20 mt-1 w-full rounded-xl border border-panel-border bg-white p-1 shadow-sm">
+                        {isDestinationSearchLoading ? (
+                          <p className="px-2 py-1 text-xs text-app-muted">Searching...</p>
+                        ) : (
+                          <ul role="listbox" className="max-h-44 overflow-auto">
+                            {destinationSuggestions.map((suggestion, index) => (
+                              <li key={suggestion.id}>
+                                <button
+                                  type="button"
+                                  onMouseDown={(event) => {
+                                    event.preventDefault();
+                                    applyDestinationSuggestion(suggestion);
+                                  }}
+                                  className={`w-full rounded-lg px-2 py-2 text-left text-xs ${
+                                    index === activeDestinationSuggestionIndex
+                                      ? "bg-accent/10 text-app-foreground"
+                                      : "text-app-muted"
+                                  }`}
+                                >
+                                  <p className="font-medium text-app-foreground">{suggestion.label}</p>
+                                  <p>{suggestion.fullLabel}</p>
+                                </button>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                    ) : null}
+                  </div>
+                  {destinationSearchError ? <p className="mt-1 text-xs text-amber-700">{destinationSearchError}</p> : null}
+                </section>
 
-            <section>
-              <p className="text-sm font-medium">Vibe &amp; Scenery</p>
-              <div className="mt-3 grid grid-cols-2 gap-2">
-                {preferenceButtonOrder.map((key) => {
-                  const enabled = preferences[key];
-                  return (
+                <section>
+                  <div className="flex items-center justify-between">
+                    <p className="text-sm font-medium">Waypoints (Optional)</p>
                     <button
-                      key={key}
                       type="button"
-                      onClick={() => togglePreference(key)}
-                      className={`h-8 rounded-lg border px-3 text-left text-sm capitalize transition ${
-                        enabled
-                          ? "border-accent bg-accent/10 text-app-foreground"
-                          : "border-panel-border bg-white text-app-muted"
-                      }`}
-                      aria-pressed={enabled}
+                      onClick={addWaypoint}
+                      disabled={waypoints.length >= MAX_WAYPOINTS}
+                      className="h-7 rounded-lg border border-panel-border bg-white px-2 text-xs disabled:opacity-50"
                     >
-                      {preferenceLabels[key]}
+                      Add waypoint
                     </button>
-                  );
-                })}
-              </div>
-              <button
-                type="button"
-                onClick={() => {
-                  setSessionState((prev) => ({
-                    ...prev,
-                    includeMustSees: !prev.includeMustSees,
-                  }));
-                }}
-                className={`mt-3 h-9 w-full rounded-lg border px-3 text-left text-sm font-medium transition ${
-                  includeMustSees
-                    ? "border-accent bg-accent/10 text-app-foreground"
-                    : "border-panel-border bg-white text-app-muted"
-                }`}
-                aria-pressed={includeMustSees}
-              >
-                Include Must-See Landmarks
-              </button>
-            </section>
+                  </div>
+                  <div className="mt-3 space-y-2">
+                    {waypoints.length === 0 ? <p className="text-xs text-app-muted">Add up to 3 waypoint stops.</p> : null}
+                    {waypoints.map((waypoint, index) => (
+                      <div key={`waypoint-${index}`} className="relative rounded-xl border border-panel-border bg-white p-2">
+                        <div className="mb-2 flex items-center justify-between">
+                          <p className="text-xs font-medium text-app-muted">Waypoint {index + 1}</p>
+                          <button
+                            type="button"
+                            onClick={() => removeWaypoint(index)}
+                            className="text-xs text-app-muted hover:text-app-foreground"
+                          >
+                            Remove
+                          </button>
+                        </div>
+                        <input
+                          value={waypoint.searchText}
+                          onChange={(event) => {
+                            updateWaypointSearchText(index, event.target.value);
+                            setWaypointSearchError(null);
+                            setActiveWaypointIndex(index);
+                            setShowWaypointSuggestions(true);
+                          }}
+                          onFocus={() => {
+                            setActiveWaypointIndex(index);
+                            if (waypointSuggestions.length > 0) {
+                              setShowWaypointSuggestions(true);
+                            }
+                          }}
+                          onBlur={() => {
+                            window.setTimeout(() => {
+                              setShowWaypointSuggestions(false);
+                            }, 120);
+                          }}
+                          onKeyDown={(event) => handleWaypointSearchKeyDown(event, index)}
+                          placeholder="Search waypoint"
+                          className="h-8 w-full rounded-lg border border-panel-border px-2 text-xs"
+                          aria-label={`Search waypoint ${index + 1}`}
+                        />
 
-            <button
-              type="button"
-              onClick={handleGenerate}
-              className="h-10 w-full rounded-xl bg-app-foreground text-sm font-semibold text-panel"
-            >
-              {status === "generating"
-                ? "Generating scenic route..."
-                : status === "refining"
-                  ? "Refining route..."
-                  : "Generate Scenic Route"}
-            </button>
+                        {activeWaypointIndex === index &&
+                        showWaypointSuggestions &&
+                        (isWaypointSearchLoading || waypointSuggestions.length > 0) ? (
+                          <div className="absolute left-2 right-2 top-[70px] z-20 rounded-xl border border-panel-border bg-white p-1 shadow-sm">
+                            {isWaypointSearchLoading ? (
+                              <p className="px-2 py-1 text-xs text-app-muted">Searching...</p>
+                            ) : (
+                              <ul role="listbox" className="max-h-40 overflow-auto">
+                                {waypointSuggestions.map((suggestion, suggestionIndex) => (
+                                  <li key={suggestion.id}>
+                                    <button
+                                      type="button"
+                                      onMouseDown={(event) => {
+                                        event.preventDefault();
+                                        applyWaypointSuggestion(index, suggestion);
+                                      }}
+                                      className={`w-full rounded-lg px-2 py-2 text-left text-xs ${
+                                        suggestionIndex === activeWaypointSuggestionIndex
+                                          ? "bg-accent/10 text-app-foreground"
+                                          : "text-app-muted"
+                                      }`}
+                                    >
+                                      <p className="font-medium text-app-foreground">{suggestion.label}</p>
+                                      <p>{suggestion.fullLabel}</p>
+                                    </button>
+                                  </li>
+                                ))}
+                              </ul>
+                            )}
+                          </div>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                  {waypointSearchError ? <p className="mt-1 text-xs text-amber-700">{waypointSearchError}</p> : null}
+                </section>
+
+                <section className="rounded-xl border border-panel-border bg-white p-3">
+                  <div className="flex items-center justify-between text-sm font-medium">
+                    <span>Duration</span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setSessionState((prev) => ({
+                          ...prev,
+                          customDuration: !prev.customDuration,
+                        }))
+                      }
+                      className="rounded-md border border-panel-border px-2 py-1 text-xs"
+                    >
+                      {customDuration ? "Custom" : "Auto"}
+                    </button>
+                  </div>
+                  {customDuration ? (
+                    <div>
+                      <div className="mt-2 flex items-center justify-between text-xs text-app-muted">
+                        <span>Selected</span>
+                        <span className="text-accent">{durationMinutes} min</span>
+                      </div>
+                      <input
+                        id="duration"
+                        type="range"
+                        min={15}
+                        max={480}
+                        step={15}
+                        value={durationMinutes}
+                        onChange={(event) =>
+                          setSessionState((prev) => ({
+                            ...prev,
+                            durationMinutes: Number(event.target.value),
+                          }))
+                        }
+                        className="mt-3 w-full accent-accent"
+                      />
+                      <div className="mt-2 flex justify-between text-[11px] text-app-muted">
+                        <span>15m</span>
+                        <span>1h</span>
+                        <span>2h</span>
+                        <span>4h</span>
+                        <span>8h</span>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="mt-2 text-xs text-app-muted">Auto mode uses an optimal duration based on route context.</p>
+                  )}
+                </section>
+
+                <section>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSessionState((prev) => ({
+                        ...prev,
+                        avoidBusyRoads: !prev.avoidBusyRoads,
+                      }));
+                    }}
+                    className={`h-9 w-full rounded-xl border px-3 text-left text-sm font-medium transition ${
+                      avoidBusyRoads
+                        ? "border-accent bg-accent/10 text-app-foreground"
+                        : "border-panel-border bg-white text-app-muted"
+                    }`}
+                    aria-pressed={avoidBusyRoads}
+                  >
+                    Avoid Busy Roads
+                  </button>
+                </section>
+
+                <button
+                  type="button"
+                  onClick={handleGenerate}
+                  className="h-10 w-full rounded-xl bg-app-foreground text-sm font-semibold text-panel"
+                >
+                  {status === "generating"
+                    ? "Generating scenic route..."
+                    : status === "refining"
+                      ? "Refining route..."
+                      : "Generate Scenic Route"}
+                </button>
+              </div>
+            ) : null}
 
             {requestError ? <p className="text-xs text-red-600">{requestError}</p> : null}
             {locationNote ? <p className="text-xs text-amber-700">{locationNote}</p> : null}
             {aiRouteNote ? <p className="text-xs text-app-muted">{aiRouteNote}</p> : null}
 
-            <section className="space-y-3 border-t border-panel-border pt-4">
+            {sidebarTab === "results" ? (
+              <section className="space-y-3 border-t border-panel-border pt-4">
               <div className="flex items-start justify-between gap-3">
                 <div>
                   <p className="text-[22px] font-medium leading-tight">{routeTitle}</p>
@@ -1705,13 +1504,12 @@ export function ScenicPlannerShell() {
                 <div className="rounded-xl border border-panel-border bg-white p-3">
                   <p className="text-xs font-semibold uppercase tracking-wider text-app-muted">Route Options</p>
                   <div className="mt-2 grid gap-2">
-                    {generatedRoutes.map((route, index) => {
+                    {generatedRoutes.map((route) => {
                       const distanceKm = (route.distanceMeters / 1000).toFixed(1);
                       const minutes = Math.round(route.durationSeconds / 60);
                       const isActive = activeRouteId === route.id;
-                      const routeSummary = routeExplanationById[route.id]?.summary ?? "";
-                      const routePreview =
-                        routeSummary.length > 120 ? `${routeSummary.slice(0, 117).trimEnd()}...` : routeSummary;
+                      const theme = routeThemeById[route.id];
+                      const themeLabel = theme ? THEME_LABELS[theme] ?? "Scenic Route" : "Scenic Route";
                       return (
                         <button
                           key={route.id}
@@ -1726,11 +1524,10 @@ export function ScenicPlannerShell() {
                           }`}
                           aria-pressed={isActive}
                         >
-                          <p className="font-semibold text-app-foreground">Route #{index + 1}</p>
+                          <p className="font-semibold text-app-foreground">{themeLabel}</p>
                           <p>
-                            Score {Math.round(route.scenicScore)} - {distanceKm} km - {minutes} min
+                            Score {Math.round(route.scenicScore)} &middot; {distanceKm} km &middot; {minutes} min
                           </p>
-                          {routePreview ? <p className="mt-1 text-[11px] leading-snug">{routePreview}</p> : null}
                         </button>
                       );
                     })}
@@ -1738,129 +1535,121 @@ export function ScenicPlannerShell() {
                 </div>
               ) : null}
 
-              {activeRouteExplanation?.summary ? (
-                <div className="rounded-xl border border-panel-border bg-white p-3 text-xs text-app-muted">
-                  {activeRouteExplanation?.summary ? (
-                    <div>
-                      <p className="font-semibold uppercase tracking-wider">Why This Route</p>
-                      <p className="mt-1 text-sm leading-relaxed">{activeRouteExplanation.summary}</p>
-                    </div>
-                  ) : null}
+              <section>
+                <p className="text-xs font-semibold uppercase tracking-wider text-app-muted">Refine Route</p>
+                <div className="mt-2 flex items-center rounded-full border border-panel-border bg-white pl-3 pr-1">
+                  <input
+                    id="refine"
+                    value={refineText}
+                    onChange={(event) =>
+                      setSessionState((prev) => ({
+                        ...prev,
+                        refineText: event.target.value,
+                      }))
+                    }
+                    placeholder="e.g., Make it flatter and add more waterfront"
+                    className="h-8 flex-1 bg-transparent text-sm outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleRefine}
+                    className="flex h-7 w-7 items-center justify-center rounded-full bg-app-foreground text-panel"
+                    aria-label="Submit refine request"
+                  >
+                    ↑
+                  </button>
+                </div>
+              </section>
+
+              {showDebug ? (
+                <div className="rounded-xl border border-panel-border bg-white p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-xs font-semibold uppercase tracking-wider text-app-muted">Tag Debug</p>
+                    <select
+                      value={activeDebugTag}
+                      onChange={(event) => {
+                        setActiveDebugTag(event.target.value as PreferenceKey);
+                        if (debugHoverClearTimeoutRef.current !== null) {
+                          window.clearTimeout(debugHoverClearTimeoutRef.current);
+                          debugHoverClearTimeoutRef.current = null;
+                        }
+                        setHoveredDebugTarget(null);
+                      }}
+                      className="h-7 rounded-md border border-panel-border bg-white px-2 text-xs"
+                    >
+                      {preferenceButtonOrder.map((key) => (
+                        <option key={key} value={key}>
+                          {debugTagLabels[key]}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="mt-2 max-h-40 space-y-2 overflow-auto pr-1">
+                    {debugMatches.length > 0 ? (
+                      debugMatches.map((match) => {
+                        const objectTitle = match.name?.trim() || match.objectId;
+                        const tagSummary = Object.entries(match.tags)
+                          .filter(([key]) => key !== "name")
+                          .slice(0, 3)
+                          .map(([key, value]) => `${key}=${value}`)
+                          .join(", ");
+
+                        return (
+                          <div
+                            key={match.objectId}
+                            onMouseEnter={() => {
+                              if (debugHoverClearTimeoutRef.current !== null) {
+                                window.clearTimeout(debugHoverClearTimeoutRef.current);
+                                debugHoverClearTimeoutRef.current = null;
+                              }
+                              if (typeof match.lat === "number" && typeof match.lng === "number") {
+                                setHoveredDebugTarget({
+                                  coordinates: [match.lng, match.lat],
+                                  name: objectTitle,
+                                });
+                                return;
+                              }
+                              setHoveredDebugTarget(null);
+                            }}
+                            onMouseLeave={() => {
+                              if (debugHoverClearTimeoutRef.current !== null) {
+                                window.clearTimeout(debugHoverClearTimeoutRef.current);
+                              }
+                              debugHoverClearTimeoutRef.current = window.setTimeout(() => {
+                                setHoveredDebugTarget(null);
+                                debugHoverClearTimeoutRef.current = null;
+                              }, DEBUG_HOVER_CLEAR_DELAY_MS);
+                            }}
+                            className="rounded-lg border border-panel-border p-2 text-xs text-app-muted transition duration-150 hover:-translate-y-0.5 hover:scale-[1.01] hover:border-accent/40 hover:bg-accent/5"
+                          >
+                            <p className="font-medium text-app-foreground">{objectTitle}</p>
+                            <p>{tagSummary || "Tagged scenic feature"}</p>
+                            {typeof match.lat === "number" && typeof match.lng === "number" ? (
+                              <p>
+                                {match.lat.toFixed(5)}, {match.lng.toFixed(5)}
+                              </p>
+                            ) : null}
+                          </div>
+                        );
+                      })
+                    ) : (
+                      <div className="space-y-1">
+                        <p className="text-xs text-app-muted">
+                          No matched objects found for {debugTagLabels[activeDebugTag].toLowerCase()} on this route.
+                        </p>
+                        {poiContextFetchFailed ? (
+                          <p className="text-xs text-amber-700">
+                            Nearby POI lookup was unavailable for this request, so tag debug may be incomplete.
+                          </p>
+                        ) : null}
+                      </div>
+                    )}
+                  </div>
                 </div>
               ) : null}
-
-              <div className="rounded-xl border border-panel-border bg-white p-3">
-                <div className="flex items-center justify-between gap-2">
-                  <p className="text-xs font-semibold uppercase tracking-wider text-app-muted">Tag Debug</p>
-                  <select
-                    value={activeDebugTag}
-                    onChange={(event) => {
-                      setActiveDebugTag(event.target.value as PreferenceKey);
-                      if (debugHoverClearTimeoutRef.current !== null) {
-                        window.clearTimeout(debugHoverClearTimeoutRef.current);
-                        debugHoverClearTimeoutRef.current = null;
-                      }
-                      setHoveredDebugTarget(null);
-                    }}
-                    className="h-7 rounded-md border border-panel-border bg-white px-2 text-xs"
-                  >
-                    {preferenceButtonOrder.map((key) => (
-                      <option key={key} value={key}>
-                        {debugTagLabels[key]}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div className="mt-2 max-h-40 space-y-2 overflow-auto pr-1">
-                  {debugMatches.length > 0 ? (
-                    debugMatches.map((match) => {
-                      const objectTitle = match.name?.trim() || match.objectId;
-                      const tagSummary = Object.entries(match.tags)
-                        .filter(([key]) => key !== "name")
-                        .slice(0, 3)
-                        .map(([key, value]) => `${key}=${value}`)
-                        .join(", ");
-
-                      return (
-                        <div
-                          key={match.objectId}
-                          onMouseEnter={() => {
-                            if (debugHoverClearTimeoutRef.current !== null) {
-                              window.clearTimeout(debugHoverClearTimeoutRef.current);
-                              debugHoverClearTimeoutRef.current = null;
-                            }
-                            if (typeof match.lat === "number" && typeof match.lng === "number") {
-                              setHoveredDebugTarget({
-                                coordinates: [match.lng, match.lat],
-                                name: objectTitle,
-                              });
-                              return;
-                            }
-                            setHoveredDebugTarget(null);
-                          }}
-                          onMouseLeave={() => {
-                            if (debugHoverClearTimeoutRef.current !== null) {
-                              window.clearTimeout(debugHoverClearTimeoutRef.current);
-                            }
-                            debugHoverClearTimeoutRef.current = window.setTimeout(() => {
-                              setHoveredDebugTarget(null);
-                              debugHoverClearTimeoutRef.current = null;
-                            }, DEBUG_HOVER_CLEAR_DELAY_MS);
-                          }}
-                          className="rounded-lg border border-panel-border p-2 text-xs text-app-muted transition duration-150 hover:-translate-y-0.5 hover:scale-[1.01] hover:border-accent/40 hover:bg-accent/5"
-                        >
-                          <p className="font-medium text-app-foreground">{objectTitle}</p>
-                          <p>{tagSummary || "Tagged scenic feature"}</p>
-                          {typeof match.lat === "number" && typeof match.lng === "number" ? (
-                            <p>
-                              {match.lat.toFixed(5)}, {match.lng.toFixed(5)}
-                            </p>
-                          ) : null}
-                        </div>
-                      );
-                    })
-                  ) : (
-                    <div className="space-y-1">
-                      <p className="text-xs text-app-muted">
-                        No matched objects found for {debugTagLabels[activeDebugTag].toLowerCase()} on this route.
-                      </p>
-                      {poiContextFetchFailed ? (
-                        <p className="text-xs text-amber-700">
-                          Nearby POI lookup was unavailable for this request, so tag debug may be incomplete.
-                        </p>
-                      ) : null}
-                    </div>
-                  )}
-                </div>
-              </div>
-            </section>
-
-            <section>
-              <p className="text-xs font-semibold uppercase tracking-wider text-app-muted">Refine Route</p>
-              <div className="mt-2 flex items-center rounded-full border border-panel-border bg-white pl-3 pr-1">
-                <input
-                  id="refine"
-                  value={refineText}
-                  onChange={(event) =>
-                    setSessionState((prev) => ({
-                      ...prev,
-                      refineText: event.target.value,
-                    }))
-                  }
-                  placeholder="e.g., Make it completely flat..."
-                  className="h-8 flex-1 bg-transparent text-sm outline-none"
-                />
-                <button
-                  type="button"
-                  onClick={handleRefine}
-                  className="flex h-7 w-7 items-center justify-center rounded-full bg-app-foreground text-panel"
-                  aria-label="Submit refine request"
-                >
-                  ↑
-                </button>
-              </div>
-            </section>
+              </section>
+            ) : null}
           </div>
         </aside>
 

@@ -48,6 +48,10 @@ BUSY_HIGHWAY_TAGS = {
     "trunk_link",
     "primary",
     "primary_link",
+    "secondary",
+    "secondary_link",
+    "tertiary",
+    "tertiary_link",
 }
 
 WALKING_SPEED_MPS = 1.35
@@ -75,7 +79,15 @@ class EdgeFeatures:
 
     @property
     def scenic_score(self) -> float:
-        return float(self.nature + self.water + self.culture)
+        return float(
+            self.nature
+            + self.water
+            + self.historic
+            + self.viewpoints
+            + self.culture
+            + self.cafes
+            - self.busyRoad
+        )
 
 
 def _destination_for_walk(origin: Location, distance_meters: float, bearing_deg: float) -> tuple[float, float]:
@@ -333,12 +345,26 @@ def _dedupe_routes(routes: list[dict]) -> list[dict]:
     return unique
 
 
-def _annotate_graph_edges(graph: nx.MultiDiGraph, constraints: Constraints, scenic_k: float) -> None:
+def _annotate_graph_edges(
+    graph: nx.MultiDiGraph,
+    constraints: Constraints,
+    scenic_k: float,
+    feature_weights: dict[str, float] | None = None,
+) -> None:
+    fw = feature_weights or {}
     for _, _, _, edge_data in graph.edges(keys=True, data=True):
         features = _extract_edge_features(edge_data)
-        scenic_score = features.scenic_score
+        scenic_score = (
+            fw.get("nature", 1.0) * features.nature
+            + fw.get("water", 1.0) * features.water
+            + fw.get("historic", 1.0) * features.historic
+            + fw.get("viewpoints", 1.0) * features.viewpoints
+            + fw.get("culture", 1.0) * features.culture
+            + fw.get("cafes", 1.0) * features.cafes
+            - fw.get("busyRoad", 1.0) * features.busyRoad
+        )
         length = float(edge_data.get("length", 1.0))
-        weight = length / (1.0 + scenic_k * scenic_score)
+        weight = length / (1.0 + scenic_k * max(scenic_score, 0.0))
 
         if constraints.avoidBusyRoads and features.busyRoad:
             weight = float("inf")
@@ -361,6 +387,7 @@ def build_graph_routes(
     duration_minutes: int,
     constraints: Constraints,
     scenic_k: float = 1.0,
+    feature_weights: dict[str, float] | None = None,
 ) -> list[dict]:
     target_distance = max(1_200.0, min(9_000.0, duration_minutes * 75.0))
     target_duration_seconds = duration_minutes * 60
@@ -377,7 +404,12 @@ def build_graph_routes(
     if graph.number_of_nodes() == 0:
         return []
 
-    _annotate_graph_edges(graph=graph, constraints=constraints, scenic_k=max(0.0, scenic_k))
+    _annotate_graph_edges(
+        graph=graph,
+        constraints=constraints,
+        scenic_k=max(0.0, scenic_k),
+        feature_weights=feature_weights,
+    )
 
     origin_node = _nearest_node_simple(graph, lat=origin.lat, lng=origin.lng)
     candidate_specs = [

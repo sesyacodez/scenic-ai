@@ -3,7 +3,7 @@
 ## Formula
 
 $$
-ScenicScore = 100 \times (w_n N + w_w W + w_h H + w_q Q)
+ScenicScore = 100 \times (w_n N + w_w W + w_h H + w_q Q + w_v V + w_c C + w_f F)
 $$
 
 Where:
@@ -12,18 +12,24 @@ Where:
 - $W$ = water score in `[0,1]`
 - $H$ = historic score in `[0,1]`
 - $Q$ = quietness score in `[0,1]`
+- $V$ = viewpoints score in `[0,1]`
+- $C$ = culture score in `[0,1]`
+- $F$ = cafes score in `[0,1]`
 - weights sum to `1.0`
 
 ## Component Definitions
 
-- Nature: normalized proximity/density to parks and green areas along path
-- Water: normalized proximity to water bodies along path
+- Nature: normalized proximity/density to parks, green areas, and natural features along path
+- Water: normalized proximity to water bodies, rivers, and waterways along path
 - Historic: normalized landmark density or heritage POIs nearby
-- Quietness: inverse proxy of high-traffic / major road exposure
+- Quietness: inverse proxy of high-traffic / major road exposure (25% speed-based, 75% busy-road inverse)
+- Viewpoints: normalized density of designated viewpoints along path
+- Culture: normalized density of museums, galleries, theatres, and cultural landmarks along path
+- Cafes: normalized density of cafes, restaurants, and pubs along path
 
 ## Weight Rules
 
-- Each weight in `[0.05, 0.70]`
+- Each weight in `[0.0, 1.0]`
 - Sum must equal `1.0 ± 0.001`
 - Agent may adjust weights from defaults based on user intent
 
@@ -38,5 +44,5 @@ Where:
 Every selected route must return:
 
 - overall score
-- per-component breakdown
+- per-component breakdown (all 7 dimensions)
 - top 2 reason strings grounded in computed data

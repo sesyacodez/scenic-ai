@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 import os
 from typing import Iterable
@@ -216,27 +217,37 @@ async def build_mapbox_probe_routes(
     all_routes: list[dict] = []
 
     async with httpx.AsyncClient(timeout=timeout) as client:
-        for bearing, distance_factor, use_alternatives in candidate_specs:
-            destination = _destination_for_walk(origin, target_distance * distance_factor, bearing)
-            try:
-                all_routes.extend(
-                    await _request_directions(
-                        client=client,
-                        token=token,
-                        origin=origin,
-                        destination=destination,
-                        use_alternatives=use_alternatives,
-                    )
-                )
-            except httpx.HTTPError:
+        probe_tasks = [
+            _request_directions(
+                client=client,
+                token=token,
+                origin=origin,
+                destination=_destination_for_walk(origin, target_distance * distance_factor, bearing),
+                use_alternatives=use_alternatives,
+            )
+            for bearing, distance_factor, use_alternatives in candidate_specs
+        ]
+        results = await asyncio.gather(*probe_tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
                 continue
-
-            if len(all_routes) >= 7:
-                break
+            all_routes.extend(result)
 
     deduped = [route for route in _dedupe_routes(all_routes) if _is_valid_route(route)]
+
+    # Reject routes outside a reasonable duration tolerance before ranking.
+    duration_tolerance = 0.30
+    min_duration = target_duration_seconds * (1.0 - duration_tolerance)
+    max_duration = target_duration_seconds * (1.0 + duration_tolerance)
+    within_tolerance = [
+        route for route in deduped
+        if min_duration <= route["durationSeconds"] <= max_duration
+    ]
+    # Fall back to all candidates if nothing survived the filter.
+    pool = within_tolerance if within_tolerance else deduped
+
     ranked = sorted(
-        deduped,
+        pool,
         key=lambda route: _route_accuracy_score(route, target_distance, target_duration_seconds),
         reverse=True,
     )[:3]
@@ -259,6 +270,7 @@ async def build_mapbox_routes(
     constraints: Constraints,
     destination: Location | None = None,
     waypoints: list[Location] | None = None,
+    feature_weights: dict[str, float] | None = None,
 ) -> list[dict]:
     if not _is_valid_location(origin) or _is_placeholder_location(origin):
         return []
@@ -303,6 +315,7 @@ async def build_mapbox_routes(
             duration_minutes=duration_minutes,
             constraints=constraints,
             scenic_k=scenic_k,
+            feature_weights=feature_weights,
         )
     except Exception:
         return []

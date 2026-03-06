@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 import os
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 
 import httpx
 
-from app.models import AppliedWeights, Preferences, ScoreBreakdown, ScoreDebug, TagObjectMatch
+_overpass_cache: OrderedDict[str, dict | None] = OrderedDict()
+_OVERPASS_CACHE_MAX = 64
+
+from app.models import AppliedWeights, Constraints, Preferences, ScoreBreakdown, ScoreDebug, TagObjectMatch
 
 
 OVERPASS_INTERPRETER_URL = os.getenv(
@@ -78,6 +82,39 @@ DEBUG_TAG_KEYS = (
 )
 
 
+ROUTE_THEMES: dict[str, dict[str, float]] = {
+    "must_see": {
+        "nature": 0.12,
+        "water": 0.10,
+        "historic": 0.22,
+        "quiet": 0.08,
+        "viewpoints": 0.20,
+        "culture": 0.18,
+        "cafes": 0.10,
+    },
+    "cafes_culture": {
+        "nature": 0.05,
+        "water": 0.05,
+        "historic": 0.15,
+        "quiet": 0.05,
+        "viewpoints": 0.05,
+        "culture": 0.30,
+        "cafes": 0.35,
+    },
+    "views_nature": {
+        "nature": 0.30,
+        "water": 0.20,
+        "historic": 0.05,
+        "quiet": 0.10,
+        "viewpoints": 0.25,
+        "culture": 0.05,
+        "cafes": 0.05,
+    },
+}
+
+THEME_ORDER: list[str] = ["must_see", "cafes_culture", "views_nature"]
+
+
 def build_weights(preferences: Preferences) -> AppliedWeights:
     raw = {
         "nature": max(0.0, preferences.nature),
@@ -103,8 +140,12 @@ def _clamp(value: float, min_value: float = 0.0, max_value: float = 1.0) -> floa
     return max(min_value, min(max_value, value))
 
 
-def _sample_route_points(route: dict, max_points: int = 6) -> list[tuple[float, float]]:
-    coordinates = route.get("geometry", {}).coordinates if route.get("geometry") else []
+def _sample_route_points(route: dict, max_points: int = 10) -> list[tuple[float, float]]:
+    geometry = route.get("geometry")
+    if not geometry:
+        return []
+
+    coordinates = geometry.coordinates if hasattr(geometry, "coordinates") else geometry.get("coordinates", [])
     if not coordinates:
         return []
 
@@ -138,22 +179,34 @@ out center tags;
 
 
 async def _request_overpass_payload(client: httpx.AsyncClient, query: str) -> dict | None:
+    cache_key = hashlib.sha256(query.encode()).hexdigest()
+    if cache_key in _overpass_cache:
+        _overpass_cache.move_to_end(cache_key)
+        return _overpass_cache[cache_key]
+
     headers = {
         "User-Agent": "ScenicAI/0.1 (+https://scenicai.local)",
         "Accept": "application/json",
     }
 
     for endpoint in OVERPASS_INTERPRETER_URLS:
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 response = await client.post(endpoint, data={"data": query}, headers=headers)
                 response.raise_for_status()
-                return response.json()
+                payload = response.json()
+                _overpass_cache[cache_key] = payload
+                if len(_overpass_cache) > _OVERPASS_CACHE_MAX:
+                    _overpass_cache.popitem(last=False)
+                return payload
             except (httpx.HTTPError, ValueError):
-                if attempt < 2:
-                    await asyncio.sleep(0.45 * (attempt + 1))
+                if attempt < 1:
+                    await asyncio.sleep(0.4)
                 continue
 
+    _overpass_cache[cache_key] = None
+    if len(_overpass_cache) > _OVERPASS_CACHE_MAX:
+        _overpass_cache.popitem(last=False)
     return None
 
 
@@ -404,12 +457,16 @@ def _breakdown_for_route(
     culture_count: int,
     cafe_count: int,
     has_context: bool,
+    avoid_busy_roads: bool = False,
 ) -> tuple[ScoreBreakdown, float, float]:
     speed_mps = route["distanceMeters"] / max(route["durationSeconds"], 1)
     quiet_base = 1.0 - ((speed_mps - 1.1) / 1.1)
     quiet_from_speed = _clamp(0.25 + 0.75 * quiet_base)
-    quiet_from_roads = _clamp(1.0 - (busy_road_count / 10.0)) if has_context else 0.5
-    quiet = _clamp(0.45 * quiet_from_speed + 0.55 * quiet_from_roads)
+    quiet_from_roads = _clamp(1.0 - (busy_road_count / 10.0)) if has_context else 0.0
+    quiet = _clamp(0.25 * quiet_from_speed + 0.75 * quiet_from_roads)
+    if avoid_busy_roads and has_context and busy_road_count > 0:
+        quiet *= 0.7
+        quiet = _clamp(quiet)
 
     if has_context:
         nature = _count_to_score(nature_count, scale=5.0)
@@ -419,12 +476,12 @@ def _breakdown_for_route(
         culture = _count_to_score(culture_count, scale=3.8)
         cafes = _count_to_score(cafe_count, scale=3.8)
     else:
-        nature = 0.5
-        water = 0.5
-        historic = 0.5
-        viewpoints = 0.5
-        culture = 0.5
-        cafes = 0.5
+        nature = 0.0
+        water = 0.0
+        historic = 0.0
+        viewpoints = 0.0
+        culture = 0.0
+        cafes = 0.0
 
     return (
         ScoreBreakdown(
@@ -454,15 +511,20 @@ def scenic_score(breakdown: ScoreBreakdown, weights: AppliedWeights) -> float:
     return round(score_0_1 * 100, 2)
 
 
-async def score_routes(routes: list[dict], preferences: Preferences) -> tuple[list[dict], AppliedWeights]:
+async def score_routes(
+    routes: list[dict],
+    preferences: Preferences,
+    constraints: Constraints | None = None,
+) -> tuple[list[dict], AppliedWeights]:
     weights = build_weights(preferences)
+    avoid_busy = constraints is not None and constraints.avoidBusyRoads
     scored_routes: list[dict] = []
 
     timeout = httpx.Timeout(8.0, connect=3.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        route_contexts = []
-        for route in routes:
-            route_contexts.append(await _fetch_route_context(client=client, route=route))
+        route_contexts = await asyncio.gather(
+            *[_fetch_route_context(client=client, route=route) for route in routes]
+        )
 
     for route, context in zip(routes, route_contexts):
         (
@@ -487,6 +549,7 @@ async def score_routes(routes: list[dict], preferences: Preferences) -> tuple[li
             culture_count=culture_count,
             cafe_count=cafe_count,
             has_context=has_context,
+            avoid_busy_roads=avoid_busy,
         )
         score = scenic_score(breakdown, weights)
         scored_routes.append(
@@ -523,3 +586,118 @@ async def score_routes(routes: list[dict], preferences: Preferences) -> tuple[li
         reverse=True,
     )
     return ranked, weights
+
+
+async def score_routes_themed(
+    routes: list[dict],
+    preferences: Preferences | None = None,
+    constraints: Constraints | None = None,
+) -> tuple[list[tuple[str, dict]], AppliedWeights]:
+    """Score routes once, then greedily assign the best candidate per theme.
+
+    Uses *user preferences* for the displayed ``scenicScore`` on each route,
+    while theme-specific weights are only used internally for deciding which
+    route best fits each theme label.
+
+    Returns a list of ``(theme_key, scored_route_dict)`` tuples in
+    ``THEME_ORDER`` and the user-preference ``AppliedWeights``.
+    """
+
+    if preferences is not None:
+        user_weights = build_weights(preferences)
+    else:
+        user_weights = build_weights(Preferences(
+            nature=1 / 7, water=1 / 7, historic=1 / 7, quiet=1 / 7,
+            viewpoints=1 / 7, culture=1 / 7, cafes=1 / 7,
+        ))
+
+    avoid_busy = constraints is not None and constraints.avoidBusyRoads
+
+    # --- compute breakdowns once per candidate --------------------------
+    timeout = httpx.Timeout(8.0, connect=3.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        route_contexts = await asyncio.gather(
+            *[_fetch_route_context(client=client, route=r) for r in routes]
+        )
+
+    enriched: list[tuple[dict, ScoreBreakdown]] = []
+    for route, context in zip(routes, route_contexts):
+        (
+            nature_count,
+            water_count,
+            historic_count,
+            busy_road_count,
+            viewpoint_count,
+            culture_count,
+            cafe_count,
+            has_context,
+            tag_object_matches,
+            poi_context_fetch_failed,
+        ) = context
+
+        breakdown, quiet_from_speed, quiet_from_roads = _breakdown_for_route(
+            route,
+            nature_count=nature_count,
+            water_count=water_count,
+            historic_count=historic_count,
+            busy_road_count=busy_road_count,
+            viewpoint_count=viewpoint_count,
+            culture_count=culture_count,
+            cafe_count=cafe_count,
+            has_context=has_context,
+            avoid_busy_roads=avoid_busy,
+        )
+
+        route_with_debug = {
+            **route,
+            "scoreBreakdown": breakdown,
+            "scoreDebug": ScoreDebug(
+                contextAvailable=has_context,
+                poiContextFetchFailed=poi_context_fetch_failed,
+                natureFeatureCount=nature_count,
+                waterFeatureCount=water_count,
+                historicFeatureCount=historic_count,
+                busyRoadFeatureCount=busy_road_count,
+                viewpointFeatureCount=viewpoint_count,
+                cultureFeatureCount=culture_count,
+                cafeFeatureCount=cafe_count,
+                quietFromSpeed=quiet_from_speed,
+                quietFromRoads=quiet_from_roads,
+                tagObjectMatches={
+                    key: [TagObjectMatch(**item) for item in items]
+                    for key, items in tag_object_matches.items()
+                },
+            ),
+        }
+        enriched.append((route_with_debug, breakdown))
+
+    # --- greedy theme assignment ----------------------------------------
+    theme_weights_map = {
+        theme: AppliedWeights(**ROUTE_THEMES[theme]) for theme in THEME_ORDER
+    }
+
+    assigned: list[tuple[str, dict]] = []
+    used_indices: set[int] = set()
+
+    for theme in THEME_ORDER:
+        tw = theme_weights_map[theme]
+        best_idx = -1
+        best_score = -1.0
+        for idx, (route_dict, bd) in enumerate(enriched):
+            if idx in used_indices:
+                continue
+            s = scenic_score(bd, tw)
+            if s > best_score:
+                best_score = s
+                best_idx = idx
+        if best_idx == -1:
+            # Fewer candidates than themes — skip instead of reusing
+            continue
+        if best_idx >= 0:
+            route_dict, bd = enriched[best_idx]
+            user_score = scenic_score(bd, user_weights)
+            route_dict = {**route_dict, "scenicScore": user_score}
+            assigned.append((theme, route_dict))
+            used_indices.add(best_idx)
+
+    return assigned, user_weights

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import json
 import re
 import socket
 import logging
 import importlib
+import math
 from pathlib import Path
 from uuid import uuid4
 
@@ -60,7 +62,7 @@ from app.services.location_search import reverse_geocode, search_locations
 from app.services.ai_poi_selector import select_must_see_waypoints
 from app.services.mapbox_routes import build_mapbox_probe_routes, build_mapbox_routes
 from app.services.mock_routes import build_mock_routes
-from app.services.scoring import score_routes
+from app.services.scoring import ROUTE_THEMES, score_routes_themed
 
 
 GOOGLE_PLACES_TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
@@ -261,16 +263,21 @@ async def _prepare_iconic_narrative_locations(
     if api_key:
         timeout = httpx.Timeout(5.5, connect=2.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
-            for name, lat, lng in deduped:
-                item = await _enrich_candidate_from_places(
+            enrich_tasks = [
+                _enrich_candidate_from_places(
                     client=client,
                     api_key=api_key,
                     name=name,
                     lat=lat,
                     lng=lng,
                 )
-                if item is not None:
-                    enriched.append(item)
+                for name, lat, lng in deduped
+            ]
+            results = await asyncio.gather(*enrich_tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException) or result is None:
+                    continue
+                enriched.append(result)
     else:
         for name, _lat, _lng in deduped:
             category = _fallback_filter_without_api(name)
@@ -369,6 +376,37 @@ async def location_reverse(payload: ReverseGeocodeRequest) -> LocationSearchResp
 
 def _clamp(value: float, min_value: float, max_value: float) -> float:
     return max(min_value, min(max_value, value))
+
+
+def _haversine_meters(origin: Location, destination: Location) -> float:
+    radius = 6_371_000.0
+    phi1 = math.radians(origin.lat)
+    phi2 = math.radians(destination.lat)
+    delta_phi = math.radians(destination.lat - origin.lat)
+    delta_lambda = math.radians(destination.lng - origin.lng)
+
+    a = (
+        math.sin(delta_phi / 2.0) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2.0) ** 2
+    )
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(max(1e-12, 1.0 - a)))
+    return radius * c
+
+
+def _resolve_duration_minutes(
+    duration_minutes: int | None,
+    origin: Location,
+    destination: Location | None,
+) -> int:
+    if duration_minutes is not None:
+        return duration_minutes
+
+    if destination is None:
+        return 45
+
+    distance_km = _haversine_meters(origin, destination) / 1000.0
+    estimated_minutes = int(round((distance_km / 5.0) * 60.0 * 1.3))
+    return int(max(10, min(480, estimated_minutes)))
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -926,19 +964,27 @@ async def _build_ai_selected_explanation(
 
 async def _plan_routes(
     request_id: str,
-    origin,
-    destination,
-    waypoints,
-    duration_minutes: int,
+    origin: Location,
+    destination: Location | None,
+    waypoints: list[Location],
+    duration_minutes: int | None,
     preferences: Preferences,
     constraints: Constraints,
+    active_route_id: str | None = None,
     extra_reasons: list[str] | None = None,
     refinement_text: str | None = None,
 ) -> RouteGenerateResponse:
-    def _merge_unique_candidates(primary: list[dict], incoming: list[dict], max_items: int = 3) -> list[dict]:
+    def _merge_unique_candidates(
+        primary: list[dict],
+        incoming: list[dict],
+        max_items: int = 3,
+        target_duration_seconds: int | None = None,
+        duration_tolerance: float = 0.30,
+    ) -> list[dict]:
         merged: list[dict] = []
         seen: set[tuple[int, int]] = set()
-        for route in [*primary, *incoming]:
+        # Always keep primary routes — they were already accepted.
+        for route in primary:
             distance = int(route.get("distanceMeters") or 0)
             duration = int(route.get("durationSeconds") or 0)
             if distance <= 0 or duration <= 0:
@@ -950,6 +996,24 @@ async def _plan_routes(
             merged.append(route)
             if len(merged) >= max_items:
                 break
+        # Apply duration filter only to incoming routes.
+        if len(merged) < max_items:
+            min_dur = (target_duration_seconds * (1.0 - duration_tolerance)) if target_duration_seconds else None
+            max_dur = (target_duration_seconds * (1.0 + duration_tolerance)) if target_duration_seconds else None
+            for route in incoming:
+                distance = int(route.get("distanceMeters") or 0)
+                duration = int(route.get("durationSeconds") or 0)
+                if distance <= 0 or duration <= 0:
+                    continue
+                if min_dur is not None and not (min_dur <= duration <= max_dur):
+                    continue
+                signature = (distance, duration)
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                merged.append(route)
+                if len(merged) >= max_items:
+                    break
         return merged
 
     ai_used = False
@@ -959,8 +1023,21 @@ async def _plan_routes(
     ai_selection_latency_ms: int | None = None
     route_waypoints = waypoints
     alternate_destinations: list[Location] = []
+    resolved_duration_minutes = _resolve_duration_minutes(duration_minutes, origin, destination)
+    # Preserve prior POI discovery behavior: when no explicit duration is provided,
+    # keep a wider baseline radius for must-see selection.
+    poi_selection_duration_minutes = duration_minutes if duration_minutes is not None else 45
 
-    if destination is not None or constraints.includeMustSees:
+    must_see_constraints = Constraints(
+        avoidBusyRoads=constraints.avoidBusyRoads,
+        includeMustSees=True,
+    )
+    focus_constraints = Constraints(
+        avoidBusyRoads=constraints.avoidBusyRoads,
+        includeMustSees=False,
+    )
+
+    if destination is not None or must_see_constraints.includeMustSees:
         (
             route_waypoints,
             selected_pois,
@@ -972,28 +1049,30 @@ async def _plan_routes(
             origin=origin,
             destination=destination,
             waypoints=waypoints,
-            duration_minutes=duration_minutes,
+            duration_minutes=poi_selection_duration_minutes,
             preferences=preferences,
             refinement_text=refinement_text,
-            max_new_waypoints=2 if constraints.includeMustSees else 1,
-            force_must_sees=constraints.includeMustSees,
+            max_new_waypoints=2 if must_see_constraints.includeMustSees else 1,
+            force_must_sees=must_see_constraints.includeMustSees,
         )
 
-    route_destination = destination
-    routing_waypoints = route_waypoints
-    if destination is None and constraints.includeMustSees and selected_pois:
-        route_destination = selected_pois[0].location
+    must_see_destination = destination
+    must_see_waypoints = route_waypoints
+    if destination is None and must_see_constraints.includeMustSees and selected_pois:
+        must_see_destination = selected_pois[0].location
         alternate_destinations = [poi.location for poi in selected_pois[1:3]]
-        destination_signature = (round(route_destination.lat, 5), round(route_destination.lng, 5))
-        routing_waypoints = [
+        destination_signature = (round(must_see_destination.lat, 5), round(must_see_destination.lng, 5))
+        must_see_waypoints = [
             waypoint
             for waypoint in route_waypoints
             if (round(waypoint.lat, 5), round(waypoint.lng, 5)) != destination_signature
         ]
 
     logger.info(
-        "route_request_id=%s ai_used=%s ai_selection_mode=%s ai_selection_latency_ms=%s ai_fallback_reason=%s selected_poi_count=%s",
+        "route_request_id=%s active_route_id=%s resolved_duration_minutes=%s ai_used=%s ai_selection_mode=%s ai_selection_latency_ms=%s ai_fallback_reason=%s selected_poi_count=%s",
         request_id,
+        active_route_id,
+        resolved_duration_minutes,
         ai_used,
         ai_selection_mode,
         ai_selection_latency_ms,
@@ -1001,15 +1080,15 @@ async def _plan_routes(
         len(selected_pois),
     )
 
-    candidates = await build_mapbox_routes(
+    must_see_candidates = await build_mapbox_routes(
         origin=origin,
-        duration_minutes=duration_minutes,
-        constraints=constraints,
-        destination=route_destination,
-        waypoints=routing_waypoints,
+        duration_minutes=resolved_duration_minutes,
+        constraints=must_see_constraints,
+        destination=must_see_destination,
+        waypoints=must_see_waypoints,
     )
 
-    if route_destination is not None and not candidates:
+    if must_see_destination is not None and not must_see_candidates:
         return RouteGenerateResponse(
             status="no_route",
             requestId=request_id,
@@ -1035,54 +1114,191 @@ async def _plan_routes(
             aiSelectionLatencyMs=ai_selection_latency_ms,
         )
 
-    if route_destination is not None and 0 < len(candidates) < 3:
+    if must_see_destination is not None and 0 < len(must_see_candidates) < 3:
         variant_plan: list[tuple[Location, list[Location]]] = []
 
-        if routing_waypoints:
-            variant_plan.append((route_destination, []))
-            for waypoint in routing_waypoints[:2]:
-                variant_plan.append((route_destination, [waypoint]))
+        if must_see_waypoints:
+            variant_plan.append((must_see_destination, []))
+            for waypoint in must_see_waypoints[:2]:
+                variant_plan.append((must_see_destination, [waypoint]))
 
         for alt_destination in alternate_destinations:
             variant_plan.append((alt_destination, []))
 
+        variant_tasks = []
         for variant_destination, variant_waypoints in variant_plan:
             variant_destination_signature = (round(variant_destination.lat, 5), round(variant_destination.lng, 5))
-            if variant_destination_signature == (round(route_destination.lat, 5), round(route_destination.lng, 5)) and variant_waypoints == routing_waypoints:
+            if variant_destination_signature == (round(must_see_destination.lat, 5), round(must_see_destination.lng, 5)) and variant_waypoints == must_see_waypoints:
                 continue
-
-            supplemental = await build_mapbox_routes(
-                origin=origin,
-                duration_minutes=duration_minutes,
-                constraints=constraints,
-                destination=variant_destination,
-                waypoints=variant_waypoints,
+            variant_tasks.append(
+                build_mapbox_routes(
+                    origin=origin,
+                    duration_minutes=resolved_duration_minutes,
+                    constraints=must_see_constraints,
+                    destination=variant_destination,
+                    waypoints=variant_waypoints,
+                )
             )
-            candidates = _merge_unique_candidates(candidates, supplemental, max_items=3)
-            if len(candidates) >= 3:
-                break
+        if variant_tasks:
+            variant_results = await asyncio.gather(*variant_tasks, return_exceptions=True)
+            for supplemental in variant_results:
+                if isinstance(supplemental, BaseException):
+                    continue
+                must_see_candidates = _merge_unique_candidates(
+                    must_see_candidates, supplemental, max_items=3,
+                )
+                if len(must_see_candidates) >= 3:
+                    break
 
-    if route_destination is None and len(candidates) < 3:
-        candidates = await build_mapbox_probe_routes(
+    if must_see_destination is None and len(must_see_candidates) < 1:
+        must_see_candidates = await build_mapbox_probe_routes(
             origin=origin,
-            duration_minutes=duration_minutes,
-            constraints=constraints,
+            duration_minutes=resolved_duration_minutes,
+            constraints=must_see_constraints,
         )
 
-    if route_destination is None and len(candidates) < 3:
-        candidates = build_mock_routes(origin)
+    if must_see_destination is None and len(must_see_candidates) < 1:
+        must_see_candidates = build_mock_routes(origin, duration_minutes=resolved_duration_minutes)
 
-    ranked, weights = await score_routes(candidates, preferences)
+    # --- Generate theme-aware focus candidates ---
+    # When no destination is set the graph router is used; generate separate
+    # candidate sets biased toward each theme's feature priorities so the
+    # resulting routes genuinely differ in scenic character.
+    _THEME_FEATURE_WEIGHTS: dict[str, dict[str, float]] = {
+        "cafes_culture": {
+            "nature": 0.3, "water": 0.3, "historic": 1.0,
+            "viewpoints": 0.3, "culture": 2.5, "cafes": 2.5, "busyRoad": 0.8,
+        },
+        "views_nature": {
+            "nature": 2.5, "water": 2.0, "historic": 0.3,
+            "viewpoints": 2.5, "culture": 0.3, "cafes": 0.3, "busyRoad": 1.2,
+        },
+    }
 
-    for index, route in enumerate(ranked, start=1):
-        route["id"] = f"route_{index}"
+    if destination is None:
+        # Theme-biased graph routes — run in parallel
+        cafes_task = build_mapbox_routes(
+            origin=origin,
+            duration_minutes=resolved_duration_minutes,
+            constraints=focus_constraints,
+            destination=None,
+            waypoints=waypoints,
+            feature_weights=_THEME_FEATURE_WEIGHTS["cafes_culture"],
+        )
+        views_task = build_mapbox_routes(
+            origin=origin,
+            duration_minutes=resolved_duration_minutes,
+            constraints=focus_constraints,
+            destination=None,
+            waypoints=waypoints,
+            feature_weights=_THEME_FEATURE_WEIGHTS["views_nature"],
+        )
+        cafes_candidates, views_candidates = await asyncio.gather(cafes_task, views_task)
+        # Merge into a single focus pool so the themed assignment step still works
+        focus_candidates = _merge_unique_candidates(cafes_candidates, views_candidates, max_items=6)
+    else:
+        focus_candidates = await build_mapbox_routes(
+            origin=origin,
+            duration_minutes=resolved_duration_minutes,
+            constraints=focus_constraints,
+            destination=destination,
+            waypoints=waypoints,
+        )
 
-    routes = [RouteResult(**route) for route in ranked]
-    selected = routes[0]
+    if destination is None and len(focus_candidates) < 2:
+        focus_candidates = _merge_unique_candidates(
+            focus_candidates,
+            await build_mapbox_probe_routes(
+                origin=origin,
+                duration_minutes=resolved_duration_minutes,
+                constraints=focus_constraints,
+            ),
+            max_items=6,
+            target_duration_seconds=resolved_duration_minutes * 60,
+        )
+
+    if destination is None and len(focus_candidates) < 2:
+        focus_candidates = _merge_unique_candidates(
+            focus_candidates,
+            build_mock_routes(origin, duration_minutes=resolved_duration_minutes),
+            max_items=6,
+        )
+
+    if not focus_candidates:
+        focus_candidates = list(must_see_candidates)
+
+    must_see_assignments, _ = await score_routes_themed(
+        must_see_candidates, preferences=preferences, constraints=constraints,
+    )
+    focus_assignments, weights = await score_routes_themed(
+        focus_candidates, preferences=preferences, constraints=constraints,
+    )
+
+    must_see_route = next((route for theme, route in must_see_assignments if theme == "must_see"), None)
+    cafes_route = next((route for theme, route in focus_assignments if theme == "cafes_culture"), None)
+    views_route = next((route for theme, route in focus_assignments if theme == "views_nature"), None)
+
+    if must_see_route is None and must_see_assignments:
+        must_see_route = must_see_assignments[0][1]
+    if cafes_route is None and focus_assignments:
+        cafes_route = focus_assignments[0][1]
+    if views_route is None and len(focus_assignments) > 1:
+        views_route = focus_assignments[1][1]
+
+    # Deduplicate: skip routes with identical geometry signatures
+    themed_assignments: list[tuple[str, dict]] = []
+    seen_signatures: set[tuple[int, int]] = set()
+    for theme, route in [("must_see", must_see_route), ("cafes_culture", cafes_route), ("views_nature", views_route)]:
+        if route is None:
+            continue
+        signature = (int(route.get("distanceMeters", 0)), int(route.get("durationSeconds", 0)))
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        themed_assignments.append((theme, dict(route)))
+
+    if not themed_assignments:
+        return RouteGenerateResponse(
+            status="no_route",
+            requestId=request_id,
+            selectedRouteId=None,
+            routes=[],
+            explanation=Explanation(
+                summary="No walking routes could be generated from this starting point.",
+                reasons=["Try a nearby starting point or adjust the destination"],
+            ),
+            appliedWeights={
+                "nature": 0.143,
+                "water": 0.143,
+                "historic": 0.143,
+                "quiet": 0.143,
+                "viewpoints": 0.143,
+                "culture": 0.143,
+                "cafes": 0.142,
+            },
+            aiUsed=ai_used,
+            aiFallbackReason=ai_fallback_reason,
+            selectedPois=selected_pois,
+            aiSelectionMode=ai_selection_mode,
+            aiSelectionLatencyMs=ai_selection_latency_ms,
+        )
+
+    route_destination = must_see_destination
+    routing_waypoints = must_see_waypoints
+
+    routes: list[RouteResult] = []
+    theme_by_route_id: dict[str, str] = {}
+    for index, (theme_key, scored_route) in enumerate(themed_assignments, start=1):
+        route_id = f"route_{index}"
+        scored_route["id"] = route_id
+        routes.append(RouteResult(**scored_route))
+        theme_by_route_id[route_id] = theme_key
+
+    selected = routes[0] if routes else None
 
     covered_location_lines = _build_covered_location_lines(destination=route_destination, waypoints=routing_waypoints)
     location_anchor_points = _build_location_anchor_payload(destination=route_destination, waypoints=routing_waypoints)
-    selected_landmark_lines = _extract_route_landmark_lines(selected)
+    selected_landmark_lines = _extract_route_landmark_lines(selected) if selected else []
     if ai_used and selected_pois:
         for poi in selected_pois:
             poi_line = f"{poi.name} ({poi.location.lat:.5f}, {poi.location.lng:.5f})"
@@ -1102,9 +1318,9 @@ async def _plan_routes(
         covered_location_lines=covered_location_lines,
         landmark_lines=selected_landmark_lines,
         iconic_locations=iconic_locations,
-    )
+    ) if selected else Explanation(summary="No routes could be generated.", reasons=[])
 
-    if routes:
+    if routes and selected:
         ai_waypoint_note = None
         if ai_used and selected_pois:
             poi_names = ", ".join(poi.name for poi in selected_pois)
@@ -1116,7 +1332,7 @@ async def _plan_routes(
             iconic_locations=iconic_locations,
             covered_location_names=covered_location_names,
             landmark_names=selected_landmark_names,
-            constraints=constraints,
+            constraints=must_see_constraints,
             ai_waypoint_note=ai_waypoint_note,
         )
         if ai_explanation is not None:
@@ -1131,54 +1347,101 @@ async def _plan_routes(
             reasons=[],
         )
 
+    def _build_theme_summary(
+        theme_key: str,
+        route: RouteResult,
+        location_text: str,
+        landmark_text: str,
+    ) -> str:
+        debug = route.scoreDebug
+        has_cafes = debug is not None and debug.cafeFeatureCount > 0
+        has_culture = debug is not None and debug.cultureFeatureCount > 0
+        has_nature = debug is not None and debug.natureFeatureCount > 0
+        has_viewpoints = debug is not None and debug.viewpointFeatureCount > 0
+        has_water = debug is not None and debug.waterFeatureCount > 0
+        has_historic = debug is not None and debug.historicFeatureCount > 0
+
+        if theme_key == "must_see":
+            if location_text:
+                if has_historic or has_culture:
+                    return f"A landmark-packed walk through {location_text}, hitting the area's most iconic sights."
+                return f"A walk through {location_text}, taking in local highlights along the way."
+            if landmark_text:
+                return f"A walk rich in landmarks, with highlights like {landmark_text} bringing the area to life."
+            return "An iconic walk that takes in the area's most celebrated sights and landmarks."
+
+        if theme_key == "cafes_culture":
+            cafe_phrase = "cafes and creative spots" if has_cafes else ("cultural spots" if has_culture else "local character")
+            if location_text:
+                return f"A culture-forward stroll through {location_text}, with {cafe_phrase} along the way."
+            if landmark_text:
+                if has_cafes:
+                    return f"A walk steeped in culture, passing places like {landmark_text} plus cafe stops."
+                return f"A walk exploring places like {landmark_text} with local character along the way."
+            if has_cafes and has_culture:
+                return "A laid-back cultural walk with cafes, galleries, and local character around every corner."
+            if has_cafes:
+                return "A relaxed walk with cafes and a local neighbourhood feel."
+            if has_culture:
+                return "A culture-focused walk with galleries, creative spaces, and local character."
+            return "A walk through the area's streets, soaking in the local atmosphere."
+
+        # views_nature
+        nature_bits: list[str] = []
+        if has_nature:
+            nature_bits.append("green spaces")
+        if has_water:
+            nature_bits.append("waterside paths")
+        if has_viewpoints:
+            nature_bits.append("open views")
+        nature_phrase = ", ".join(nature_bits) if nature_bits else "a calmer pace and quieter streets"
+
+        if location_text:
+            return f"A scenic route through {location_text}, featuring {nature_phrase}."
+        if landmark_text:
+            return f"A walk featuring spots like {landmark_text}, with {nature_phrase}."
+        if nature_bits:
+            return f"A nature-first route that trades bustle for {nature_phrase}."
+        return "A quieter route that favours calmer streets and a more relaxed walking rhythm."
+
     route_explanations: list[RouteExplanation] = []
     for route in routes:
-        top_labels = _top_preference_labels(route)
-        top_text = " and ".join(top_labels)
+        theme_key = theme_by_route_id.get(route.id, "must_see")
         route_landmarks = _extract_route_landmark_lines(route)
-        route_locations = covered_location_lines if covered_location_lines else route_landmarks
-        route_location_names = [_to_location_name(item) for item in route_locations if _to_location_name(item)]
+        must_see_location_lines = [
+            f"{poi.name} ({poi.location.lat:.5f}, {poi.location.lng:.5f})"
+            for poi in selected_pois
+        ]
+        if theme_key == "must_see":
+            if must_see_location_lines:
+                route_locations = must_see_location_lines
+            elif covered_location_lines:
+                route_locations = covered_location_lines
+            else:
+                route_locations = route_landmarks
+        else:
+            route_locations = route_landmarks
         route_landmark_names = [_to_location_name(item) for item in route_landmarks if _to_location_name(item)]
+        route_location_names = [_to_location_name(item) for item in route_locations if _to_location_name(item)]
         location_text = ", ".join(route_location_names[:2])
         landmark_text = ", ".join(route_landmark_names[:2])
-        if location_text:
-            summary = (
-                f"This walk leans into {top_text} and carries you naturally through {location_text}, "
-                "with a pace that feels easy and enjoyable."
-            )
-        elif landmark_text:
-            summary = (
-                f"This walk brings out {top_text}, with highlights like {landmark_text} adding personality "
-                "and a strong sense of place."
-            )
-        else:
-            summary = (
-                f"This walk brings a balanced {top_text} experience, with a scenic flow that feels more like a "
-                "local recommendation than a generic route."
-            )
+
+        summary = _build_theme_summary(theme_key, route, location_text, landmark_text)
+
         route_explanations.append(
             RouteExplanation(
                 routeId=route.id,
+                theme=theme_key,
                 summary=_limit_sentences(summary, max_sentences=4),
                 reasons=[],
                 locations=route_locations,
             )
         )
 
-    selected_route_index = next((index for index, route in enumerate(route_explanations) if route.routeId == selected.id), -1)
-    if selected_route_index >= 0:
-        selected_locations = route_explanations[selected_route_index].locations
-        route_explanations[selected_route_index] = RouteExplanation(
-            routeId=selected.id,
-            summary=explanation.summary,
-            reasons=[],
-            locations=selected_locations,
-        )
-
     return RouteGenerateResponse(
         status="ok",
         requestId=request_id,
-        selectedRouteId=selected.id,
+        selectedRouteId=selected.id if selected else None,
         routes=routes,
         explanation=explanation,
         routeExplanations=route_explanations,
@@ -1207,6 +1470,7 @@ async def generate_route(payload: RouteGenerateRequest) -> RouteGenerateResponse
         duration_minutes=payload.durationMinutes,
         preferences=payload.preferences,
         constraints=payload.constraints,
+        active_route_id=None,
         refinement_text=payload.refinementText,
     )
 
@@ -1242,7 +1506,7 @@ async def refine_route(payload: RouteRefineRequest) -> RouteGenerateResponse:
         waypoints=payload.waypoints or [],
     )
 
-    base_duration = payload.durationMinutes if payload.durationMinutes is not None else 45
+    base_duration = _resolve_duration_minutes(payload.durationMinutes, payload.origin, payload.destination)
     base_preferences = (
         payload.preferences
         if payload.preferences is not None
@@ -1291,6 +1555,7 @@ async def refine_route(payload: RouteRefineRequest) -> RouteGenerateResponse:
         duration_minutes=updated_duration,
         preferences=updated_preferences,
         constraints=updated_constraints,
+        active_route_id=payload.activeRouteId,
         extra_reasons=refinement_reasons,
         refinement_text=payload.message,
     )

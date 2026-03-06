@@ -61,7 +61,7 @@ class RouteGenerateRequest(BaseModel):
     origin: Location
     destination: Location | None = None
     waypoints: list[Location] = Field(default_factory=list, max_length=3)
-    durationMinutes: int = Field(ge=10, le=180)
+    durationMinutes: int | None = Field(default=None, ge=10, le=480)
     preferences: Preferences
     constraints: Constraints = Field(default_factory=Constraints)
     sessionId: str = Field(min_length=3)
@@ -74,7 +74,8 @@ class RouteRefineRequest(BaseModel):
     origin: Location | None = None
     destination: Location | None = None
     waypoints: list[Location] | None = Field(default=None, max_length=3)
-    durationMinutes: int | None = Field(default=None, ge=10, le=180)
+    durationMinutes: int | None = Field(default=None, ge=10, le=480)
+    activeRouteId: str | None = None
     preferences: Preferences | None = None
     constraints: Constraints = Field(default_factory=Constraints)
 
@@ -138,6 +139,7 @@ class Explanation(BaseModel):
 
 class RouteExplanation(BaseModel):
     routeId: str
+    theme: str | None = None
     summary: str
     reasons: list[str]
     locations: list[str] = Field(default_factory=list)
