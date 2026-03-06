@@ -12,6 +12,7 @@ type SessionState = {
   durationMinutes: number;
   preferences: Preferences;
   refineText: string;
+  includeMustSees: boolean;
 };
 
 type LegacySessionState = {
@@ -70,6 +71,12 @@ type GenerateResponse = {
     summary: string;
     reasons: string[];
   };
+  routeExplanations?: Array<{
+    routeId: string;
+    summary: string;
+    reasons: string[];
+    locations: string[];
+  }>;
   aiUsed?: boolean;
   aiFallbackReason?: string | null;
   selectedPois?: Array<{
@@ -134,6 +141,7 @@ const defaultState: SessionState = {
   durationMinutes: 45,
   preferences: defaultPreferences,
   refineText: "",
+  includeMustSees: false,
 };
 
 const MIN_SIDEBAR_WIDTH = 280;
@@ -232,6 +240,11 @@ export function ScenicPlannerShell() {
   const [routeTitle, setRouteTitle] = useState("Scenic Route");
   const [routeMeta, setRouteMeta] = useState("—");
   const [scenicScore, setScenicScore] = useState<number | null>(null);
+  const [generatedRoutes, setGeneratedRoutes] = useState<GeneratedRoute[]>([]);
+  const [activeRouteId, setActiveRouteId] = useState<string | null>(null);
+  const [routeExplanationById, setRouteExplanationById] = useState<
+    Record<string, { summary: string; reasons: string[]; locations: string[] }>
+  >({});
   const [explanationText, setExplanationText] = useState(
     "Generate a route to see AI reasoning grounded in scored alternatives.",
   );
@@ -242,7 +255,7 @@ export function ScenicPlannerShell() {
   const [selectedRouteCoordinates, setSelectedRouteCoordinates] = useState<number[][] | null>(null);
   const [mapCenter, setMapCenter] = useState<[number, number]>([-0.1278, 51.5074]);
 
-  const { durationMinutes, preferences, refineText } = sessionState;
+  const { durationMinutes, preferences, refineText, includeMustSees } = sessionState;
 
   useEffect(() => {
     const raw = window.localStorage.getItem(STORAGE_KEY);
@@ -257,6 +270,7 @@ export function ScenicPlannerShell() {
         setSessionState({
           ...parsed,
           preferences: { ...defaultPreferences, ...parsed.preferences },
+          includeMustSees: typeof parsed.includeMustSees === "boolean" ? parsed.includeMustSees : false,
         });
       } else if (parsed.schemaVersion === 1) {
         setSessionState({
@@ -264,6 +278,7 @@ export function ScenicPlannerShell() {
           durationMinutes: parsed.durationMinutes,
           preferences: { ...defaultPreferences, ...parsed.preferences },
           refineText: parsed.refineText,
+          includeMustSees: false,
         });
       } else {
         window.localStorage.removeItem(STORAGE_KEY);
@@ -280,14 +295,8 @@ export function ScenicPlannerShell() {
       return;
     }
 
-    const state: SessionState = {
-      schemaVersion: 2,
-      durationMinutes,
-      preferences,
-      refineText,
-    };
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-  }, [durationMinutes, isStorageReady, preferences, refineText]);
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(sessionState));
+  }, [isStorageReady, sessionState]);
 
   useEffect(() => {
     const raw = window.localStorage.getItem(ORIGIN_STORAGE_KEY);
@@ -678,6 +687,15 @@ export function ScenicPlannerShell() {
     return { lat: latValue, lng: lngValue };
   };
 
+  const originCoordinate = useMemo<[number, number] | null>(() => {
+    const origin = resolveManualOrigin();
+    if (!origin) {
+      return null;
+    }
+
+    return [origin.lng, origin.lat];
+  }, [originLat, originLng]);
+
   const isLikelyNullIsland = (lat: number, lng: number) => {
     return Math.abs(lat) < 0.001 && Math.abs(lng) < 0.001;
   };
@@ -787,6 +805,36 @@ export function ScenicPlannerShell() {
     busyRoad: "Busy Roads",
   };
 
+  const applySelectedRouteView = (
+    route: GeneratedRoute,
+    origin: { lat: number; lng: number },
+    explanationFallback: { summary: string; reasons: string[] },
+    availableRoutes: GeneratedRoute[] = generatedRoutes,
+    explanations: Record<string, { summary: string; reasons: string[]; locations: string[] }> = routeExplanationById,
+  ) => {
+    const distanceKm = (route.distanceMeters / 1000).toFixed(1);
+    const minutes = Math.round(route.durationSeconds / 60);
+    const routeIndex = availableRoutes.findIndex((candidate) => candidate.id === route.id);
+    const explanationForRoute = explanations[route.id];
+
+    setRouteTitle(
+      routeIndex >= 0 ? `Route #${routeIndex + 1}` : `Route ${route.id.replace("route_", "#")}`,
+    );
+    setRouteMeta(`${distanceKm} km ・ ${minutes} min walk`);
+    setScenicScore(route.scenicScore);
+    setExplanationText(explanationForRoute?.summary || explanationFallback.summary);
+    setSelectedRouteDebug(route.scoreDebug ?? null);
+    setActiveDebugTag(preferenceButtonOrder.find((key) => preferences[key]) ?? "nature");
+    if (debugHoverClearTimeoutRef.current !== null) {
+      window.clearTimeout(debugHoverClearTimeoutRef.current);
+      debugHoverClearTimeoutRef.current = null;
+    }
+    setHoveredDebugTarget(null);
+    setSelectedRouteCoordinates(route.geometry.coordinates);
+    setMapCenter([origin.lng, origin.lat]);
+    setActiveRouteId(route.id);
+  };
+
   const applyRouteResponse = (
     payload: GenerateResponse,
     origin: { lat: number; lng: number },
@@ -805,6 +853,10 @@ export function ScenicPlannerShell() {
       setExplanationText(payload.explanation.summary);
       setRequestError(fallbackNoRouteMessage);
       setSelectedRouteDebug(null);
+      setGeneratedRoutes([]);
+      setActiveRouteId(null);
+      setRouteExplanationById({});
+      setSelectedRouteCoordinates(null);
       if (debugHoverClearTimeoutRef.current !== null) {
         window.clearTimeout(debugHoverClearTimeoutRef.current);
         debugHoverClearTimeoutRef.current = null;
@@ -813,27 +865,40 @@ export function ScenicPlannerShell() {
       return;
     }
 
-    const selected = payload.routes.find((route) => route.id === payload.selectedRouteId) ?? payload.routes[0];
-    const distanceKm = (selected.distanceMeters / 1000).toFixed(1);
-    const minutes = Math.round(selected.durationSeconds / 60);
+    setGeneratedRoutes(payload.routes);
+    const explanationEntries = Array.isArray(payload.routeExplanations) ? payload.routeExplanations : [];
+    const explanationMap = explanationEntries.reduce<
+      Record<string, { summary: string; reasons: string[]; locations: string[] }>
+    >((acc, item) => {
+      acc[item.routeId] = {
+        summary: item.summary,
+        reasons: Array.isArray(item.reasons) ? item.reasons : [],
+        locations: Array.isArray(item.locations) ? item.locations : [],
+      };
+      return acc;
+    }, {});
+    setRouteExplanationById(explanationMap);
 
-    setRouteTitle(`Route ${selected.id.replace("route_", "#")}`);
-    setRouteMeta(`${distanceKm} km ・ ${minutes} min walk`);
-    setScenicScore(selected.scenicScore);
-    setExplanationText(payload.explanation.summary);
-    setSelectedRouteDebug(selected.scoreDebug ?? null);
-    setActiveDebugTag(preferenceButtonOrder.find((key) => preferences[key]) ?? "nature");
-    if (debugHoverClearTimeoutRef.current !== null) {
-      window.clearTimeout(debugHoverClearTimeoutRef.current);
-      debugHoverClearTimeoutRef.current = null;
+    const selected = payload.routes.find((route) => route.id === payload.selectedRouteId) ?? payload.routes[0];
+    applySelectedRouteView(selected, origin, payload.explanation, payload.routes, explanationMap);
+  };
+
+  const handleRouteSelect = (routeId: string) => {
+    const manualOrigin = resolveManualOrigin();
+    const fallbackOrigin = manualOrigin || { lat: mapCenter[1], lng: mapCenter[0] };
+    const selected = generatedRoutes.find((route) => route.id === routeId);
+    if (!selected) {
+      return;
     }
-    setHoveredDebugTarget(null);
-    setSelectedRouteCoordinates(selected.geometry.coordinates);
-    setMapCenter([origin.lng, origin.lat]);
+    applySelectedRouteView(selected, fallbackOrigin, {
+      summary: explanationText,
+      reasons: [],
+    });
   };
 
   const debugMatches = selectedRouteDebug?.tagObjectMatches?.[activeDebugTag] ?? [];
   const poiContextFetchFailed = selectedRouteDebug?.poiContextFetchFailed === true;
+  const activeRouteExplanation = activeRouteId ? routeExplanationById[activeRouteId] : undefined;
 
   const togglePreference = (key: PreferenceKey) => {
     setSessionState((prev) => ({
@@ -852,6 +917,22 @@ export function ScenicPlannerShell() {
     setActiveOriginSuggestionIndex(-1);
     setMapCenter([suggestion.location.lng, suggestion.location.lat]);
   };
+
+  const handleMapPinDrop = useCallback((coordinate: { lat: number; lng: number }) => {
+    const latText = coordinate.lat.toFixed(5);
+    const lngText = coordinate.lng.toFixed(5);
+
+    setOriginLat(latText);
+    setOriginLng(lngText);
+    setOriginLabel("");
+    setOriginSearchText(`${latText}, ${lngText}`);
+    setOriginSearchError(null);
+    setOriginSuggestions([]);
+    setShowOriginSuggestions(false);
+    setActiveOriginSuggestionIndex(-1);
+    setLocationNote("Starting point set from map pin.");
+    setMapCenter([coordinate.lng, coordinate.lat]);
+  }, []);
 
   const applyDestinationSuggestion = (suggestion: PlaceSuggestion) => {
     setDestinationLat(suggestion.location.lat.toFixed(5));
@@ -1093,7 +1174,7 @@ export function ScenicPlannerShell() {
           waypoints: stopsPayload.waypoints,
           durationMinutes,
           preferences: toPreferenceWeights(),
-          constraints: { avoidBusyRoads: preferences.quiet },
+          constraints: { avoidBusyRoads: preferences.quiet, includeMustSees },
           sessionId: "anon-web-session",
           refinementText: refineText || undefined,
         }),
@@ -1155,7 +1236,7 @@ export function ScenicPlannerShell() {
           waypoints: stopsPayload.waypoints,
           durationMinutes,
           preferences: toPreferenceWeights(),
-          constraints: { avoidBusyRoads: preferences.quiet },
+          constraints: { avoidBusyRoads: preferences.quiet, includeMustSees },
         }),
       });
 
@@ -1267,7 +1348,7 @@ export function ScenicPlannerShell() {
     <main className="h-screen overflow-hidden bg-app text-app-foreground">
       <div ref={shellRef} className="flex h-full w-full">
         <aside
-          className="flex h-full shrink-0 flex-col border-r border-panel-border bg-panel p-4"
+          className="flex h-full min-h-0 shrink-0 flex-col overflow-y-auto border-r border-panel-border bg-panel p-4"
           style={{ width: `${sidebarWidth}px` }}
         >
           <div className="flex items-center gap-2">
@@ -1278,6 +1359,7 @@ export function ScenicPlannerShell() {
           <div className="mt-10 space-y-6">
             <section>
               <p className="text-sm font-medium">Starting Point</p>
+              <p className="mt-1 text-xs text-app-muted">Click the map to drop a pin and use it as your start.</p>
               <div className="relative mt-3">
                 <input
                   value={originSearchText}
@@ -1567,6 +1649,23 @@ export function ScenicPlannerShell() {
                   );
                 })}
               </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setSessionState((prev) => ({
+                    ...prev,
+                    includeMustSees: !prev.includeMustSees,
+                  }));
+                }}
+                className={`mt-3 h-9 w-full rounded-lg border px-3 text-left text-sm font-medium transition ${
+                  includeMustSees
+                    ? "border-accent bg-accent/10 text-app-foreground"
+                    : "border-panel-border bg-white text-app-muted"
+                }`}
+                aria-pressed={includeMustSees}
+              >
+                Include Must-See Landmarks
+              </button>
             </section>
 
             <button
@@ -1599,8 +1698,56 @@ export function ScenicPlannerShell() {
                 </div>
               </div>
               <div className="rounded-xl border border-panel-border bg-white p-3 text-sm text-app-muted">
-                {explanationText} Preferences: {selectedPreferences.join(", ") || "balanced"}.
+                {explanationText}
               </div>
+
+              {generatedRoutes.length > 0 ? (
+                <div className="rounded-xl border border-panel-border bg-white p-3">
+                  <p className="text-xs font-semibold uppercase tracking-wider text-app-muted">Route Options</p>
+                  <div className="mt-2 grid gap-2">
+                    {generatedRoutes.map((route, index) => {
+                      const distanceKm = (route.distanceMeters / 1000).toFixed(1);
+                      const minutes = Math.round(route.durationSeconds / 60);
+                      const isActive = activeRouteId === route.id;
+                      const routeSummary = routeExplanationById[route.id]?.summary ?? "";
+                      const routePreview =
+                        routeSummary.length > 120 ? `${routeSummary.slice(0, 117).trimEnd()}...` : routeSummary;
+                      return (
+                        <button
+                          key={route.id}
+                          type="button"
+                          onClick={() => {
+                            handleRouteSelect(route.id);
+                          }}
+                          className={`rounded-lg border px-3 py-2 text-left text-xs transition ${
+                            isActive
+                              ? "border-accent bg-accent/10 text-app-foreground"
+                              : "border-panel-border bg-white text-app-muted hover:border-accent/40"
+                          }`}
+                          aria-pressed={isActive}
+                        >
+                          <p className="font-semibold text-app-foreground">Route #{index + 1}</p>
+                          <p>
+                            Score {Math.round(route.scenicScore)} - {distanceKm} km - {minutes} min
+                          </p>
+                          {routePreview ? <p className="mt-1 text-[11px] leading-snug">{routePreview}</p> : null}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : null}
+
+              {activeRouteExplanation?.summary ? (
+                <div className="rounded-xl border border-panel-border bg-white p-3 text-xs text-app-muted">
+                  {activeRouteExplanation?.summary ? (
+                    <div>
+                      <p className="font-semibold uppercase tracking-wider">Why This Route</p>
+                      <p className="mt-1 text-sm leading-relaxed">{activeRouteExplanation.summary}</p>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
 
               <div className="rounded-xl border border-panel-border bg-white p-3">
                 <div className="flex items-center justify-between gap-2">
@@ -1733,6 +1880,8 @@ export function ScenicPlannerShell() {
             routeCoordinates={selectedRouteCoordinates}
             fallbackCenter={mapCenter}
             highlightedLocation={hoveredDebugTarget}
+            originCoordinate={originCoordinate}
+            onMapPinDrop={handleMapPinDrop}
           />
         </section>
       </div>

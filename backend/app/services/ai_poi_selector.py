@@ -22,6 +22,22 @@ MUST_SEE_TYPES = {
     "art_gallery",
     "park",
     "botanical_garden",
+    "church",
+    "place_of_worship",
+    "hindu_temple",
+    "mosque",
+    "synagogue",
+}
+
+ICONIC_NAME_KEYWORDS = {
+    "basilica",
+    "cathedral",
+    "temple",
+    "palace",
+    "colosseum",
+    "acropolis",
+    "sagrada",
+    "gaudi",
 }
 
 PREFERENCE_TYPE_BONUS = {
@@ -122,6 +138,53 @@ def _heuristic_relevance(place: _CandidatePlace, preferences: Preferences) -> fl
     return max(0.0, min(1.0, score))
 
 
+def _destination_proximity_score(place: _CandidatePlace, destination: Location | None) -> float:
+    if destination is None:
+        return 0.0
+
+    distance_meters = _haversine_meters(place.lat, place.lng, destination.lat, destination.lng)
+    # Treat destination-adjacent POIs as materially more relevant for routed waypoints.
+    return max(0.0, min(1.0, 1.0 - (distance_meters / 2200.0)))
+
+
+def _candidate_rank_score(
+    place: _CandidatePlace,
+    preferences: Preferences,
+    ranking_anchor: Location | None,
+    force_must_sees: bool = False,
+) -> float:
+    if force_must_sees:
+        popularity_component = _normalize_rating_count(place.rating_count)
+        rating_component = _normalize_rating(place.rating)
+        proximity = _destination_proximity_score(place=place, destination=ranking_anchor)
+        must_see = 1.0 if place.types.intersection(MUST_SEE_TYPES) else 0.0
+        lowered_name = place.name.lower()
+        name_iconic = 1.0 if any(keyword in lowered_name for keyword in ICONIC_NAME_KEYWORDS) else 0.0
+        return (0.50 * popularity_component) + (0.26 * rating_component) + (0.18 * proximity) + (0.20 * must_see) + (0.08 * name_iconic)
+
+    base = _heuristic_relevance(place=place, preferences=preferences)
+    proximity = _destination_proximity_score(place=place, destination=ranking_anchor)
+    must_see = 1.0 if place.types.intersection(MUST_SEE_TYPES) else 0.0
+    return base + (0.20 * proximity) + (0.06 * proximity * must_see)
+
+
+def _pick_better_candidate(existing: _CandidatePlace, incoming: _CandidatePlace) -> _CandidatePlace:
+    if incoming.rating_count > existing.rating_count:
+        return incoming
+    if incoming.rating_count < existing.rating_count:
+        return existing
+    if incoming.rating > existing.rating:
+        return incoming
+    if incoming.rating < existing.rating:
+        return existing
+
+    incoming_must_see = bool(incoming.types.intersection(MUST_SEE_TYPES))
+    existing_must_see = bool(existing.types.intersection(MUST_SEE_TYPES))
+    if incoming_must_see and not existing_must_see:
+        return incoming
+    return existing
+
+
 def _strip_fenced_json(content: str) -> str:
     stripped = content.strip()
     if stripped.startswith("```") and stripped.endswith("```"):
@@ -201,11 +264,14 @@ def _deterministic_geo_filter(
     origin: Location,
     destination: Location | None,
     duration_minutes: int,
+    force_must_sees: bool = False,
 ) -> list[_CandidatePlace]:
     if not candidates:
         return []
 
-    max_leg_distance = max(900.0, min(5500.0, duration_minutes * 90.0))
+    leg_speed_factor = 140.0 if force_must_sees else 90.0
+    leg_cap = 7000.0 if force_must_sees else 5500.0
+    max_leg_distance = max(900.0, min(leg_cap, duration_minutes * leg_speed_factor))
 
     if destination is None:
         return [
@@ -215,7 +281,9 @@ def _deterministic_geo_filter(
         ]
 
     base_distance = _haversine_meters(origin.lat, origin.lng, destination.lat, destination.lng)
-    max_detour = max(600.0, min(3000.0, base_distance * 0.45))
+    detour_factor = 0.80 if force_must_sees else 0.45
+    detour_cap = 4500.0 if force_must_sees else 3000.0
+    max_detour = max(600.0, min(detour_cap, base_distance * detour_factor))
 
     valid: list[_CandidatePlace] = []
     for candidate in candidates:
@@ -341,6 +409,7 @@ async def select_must_see_waypoints(
     preferences: Preferences,
     refinement_text: str | None = None,
     max_new_waypoints: int = 1,
+    force_must_sees: bool = False,
 ) -> tuple[list[Location], list[SelectedPoi], bool, str | None, str | None, int | None]:
     started_at = perf_counter()
 
@@ -357,7 +426,7 @@ async def select_must_see_waypoints(
     if not _env_flag("AI_POI_SELECTOR_ENABLED", True):
         return _done(waypoints, [], False, "AI waypoint selection disabled", "disabled")
 
-    if destination is None:
+    if destination is None and not force_must_sees:
         return _done(
             waypoints,
             [],
@@ -366,7 +435,7 @@ async def select_must_see_waypoints(
             "skipped_no_destination",
         )
 
-    if waypoints:
+    if waypoints and not force_must_sees:
         return _done(
             waypoints,
             [],
@@ -387,30 +456,61 @@ async def select_must_see_waypoints(
 
     center_lat, center_lng = _midpoint(origin, destination)
     radius_meters = max(1200, min(5000, duration_minutes * 100))
+    destination_radius_meters = max(900, min(3500, int(radius_meters * 0.75)))
 
-    queries = [
+    midpoint_queries = [
         "must see landmarks and iconic attractions",
         "top rated tourist attractions",
         "historic landmarks and monuments",
     ]
+
+    destination_queries: list[str] = []
+    if destination is not None:
+        destination_queries = [
+            "iconic landmarks near destination",
+            "world famous landmarks and basilicas",
+            "top cultural monuments nearby",
+            "cathedral basilica famous churches",
+        ]
+        destination_label = (destination.label or "").strip()
+        if destination_label:
+            destination_queries.append(f"must see landmarks near {destination_label}")
+
+    query_plan: list[tuple[str, float, float, int, int]] = []
+    if force_must_sees:
+        origin_radius_meters = max(1000, min(4500, int(radius_meters * 0.9)))
+        origin_queries = [
+            "iconic landmarks near origin",
+            "major attractions close to starting point",
+            "world famous churches basilicas cathedrals",
+        ]
+        for query in origin_queries:
+            query_plan.append((query, origin.lat, origin.lng, origin_radius_meters, 16))
+
+    for query in midpoint_queries:
+        query_plan.append((query, center_lat, center_lng, radius_meters, 14))
+    if destination is not None:
+        for query in destination_queries:
+            query_plan.append((query, destination.lat, destination.lng, destination_radius_meters, 16))
 
     timeout = httpx.Timeout(6.5, connect=2.5)
     deduped: dict[str, _CandidatePlace] = {}
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            for query in queries:
+            for query, query_lat, query_lng, query_radius_meters, query_max_results in query_plan:
                 candidates = await _query_google_places(
                     client=client,
                     api_key=google_api_key,
                     query=query,
-                    center_lat=center_lat,
-                    center_lng=center_lng,
-                    radius_meters=radius_meters,
-                    max_results=12,
+                    center_lat=query_lat,
+                    center_lng=query_lng,
+                    radius_meters=query_radius_meters,
+                    max_results=query_max_results,
                 )
                 for item in candidates:
-                    deduped[item.place_id] = item
+                    existing = deduped.get(item.place_id)
+                    deduped[item.place_id] = _pick_better_candidate(existing, item) if existing is not None else item
     except httpx.HTTPError:
         return _done(
             waypoints,
@@ -435,6 +535,7 @@ async def select_must_see_waypoints(
         origin=origin,
         destination=destination,
         duration_minutes=duration_minutes,
+        force_must_sees=force_must_sees,
     )
     if not filtered:
         return _done(
@@ -446,19 +547,28 @@ async def select_must_see_waypoints(
         )
 
     by_id = {candidate.place_id: candidate for candidate in filtered}
+    ranking_anchor = destination if destination is not None else origin
     heuristic_sorted = sorted(
         filtered,
-        key=lambda candidate: _heuristic_relevance(candidate=candidate, preferences=preferences),
+        key=lambda candidate: _candidate_rank_score(
+            place=candidate,
+            preferences=preferences,
+            ranking_anchor=ranking_anchor,
+            force_must_sees=force_must_sees,
+        ),
         reverse=True,
     )
 
-    ranked_ids = await _rank_with_langgraph(
-        candidates=heuristic_sorted[:10],
-        preferences=preferences,
-        duration_minutes=duration_minutes,
-        refinement_text=refinement_text,
-    )
-    ranking_mode = "langgraph" if ranked_ids else "heuristic"
+    ranked_ids: list[str] = []
+    ranking_mode = "forced_iconic" if force_must_sees else "heuristic"
+    if not force_must_sees:
+        ranked_ids = await _rank_with_langgraph(
+            candidates=heuristic_sorted[:10],
+            preferences=preferences,
+            duration_minutes=duration_minutes,
+            refinement_text=refinement_text,
+        )
+        ranking_mode = "langgraph" if ranked_ids else "heuristic"
 
     llm_ranked: list[_CandidatePlace] = []
     for place_id in ranked_ids:
@@ -490,4 +600,18 @@ async def select_must_see_waypoints(
     ]
 
     ai_waypoints = [Location(lat=poi.location.lat, lng=poi.location.lng, label=poi.name) for poi in selected_pois]
+
+    if force_must_sees and waypoints:
+        merged_waypoints: list[Location] = list(waypoints)
+        existing_signatures = {(round(stop.lat, 5), round(stop.lng, 5)) for stop in merged_waypoints}
+        for stop in ai_waypoints:
+            signature = (round(stop.lat, 5), round(stop.lng, 5))
+            if signature in existing_signatures:
+                continue
+            merged_waypoints.append(stop)
+            existing_signatures.add(signature)
+            if len(merged_waypoints) >= 3:
+                break
+        return _done(merged_waypoints, selected_pois, True, None, ranking_mode)
+
     return _done(ai_waypoints, selected_pois, True, None, ranking_mode)

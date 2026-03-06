@@ -54,6 +54,7 @@ class Preferences(BaseModel):
 
 class Constraints(BaseModel):
     avoidBusyRoads: bool = False
+    includeMustSees: bool = False
 
 
 class RouteGenerateRequest(BaseModel):
@@ -135,6 +136,13 @@ class Explanation(BaseModel):
     reasons: list[str]
 
 
+class RouteExplanation(BaseModel):
+    routeId: str
+    summary: str
+    reasons: list[str]
+    locations: list[str] = Field(default_factory=list)
+
+
 class AppliedWeights(BaseModel):
     nature: float = Field(ge=0.0, le=1.0)
     water: float = Field(ge=0.0, le=1.0)
@@ -175,6 +183,7 @@ class RouteGenerateResponse(BaseModel):
     selectedRouteId: str | None
     routes: list[RouteResult]
     explanation: Explanation
+    routeExplanations: list[RouteExplanation] = Field(default_factory=list)
     appliedWeights: AppliedWeights
     aiUsed: bool = False
     aiFallbackReason: str | None = None

@@ -12,6 +12,8 @@ type ScenicMapProps = {
   routeCoordinates: number[][] | null;
   fallbackCenter?: [number, number];
   highlightedLocation?: HighlightedLocation | null;
+  originCoordinate?: [number, number] | null;
+  onMapPinDrop?: (coordinate: { lat: number; lng: number }) => void;
 };
 
 const SOURCE_ID = "selected-route";
@@ -24,10 +26,82 @@ const ENDPOINT_SOURCE_ID = "route-endpoints";
 const ENDPOINT_CORE_LAYER_ID = "route-endpoints-core-layer";
 const ENDPOINT_LABEL_LAYER_ID = "route-endpoints-label-layer";
 
+const buildEndpointFeatures = (
+  routeCoordinates: number[][] | null,
+  originCoordinate: [number, number] | null,
+) => {
+  if (routeCoordinates && routeCoordinates.length > 0) {
+    const startCoordinate: [number, number] = [routeCoordinates[0][0], routeCoordinates[0][1]];
+    const endCoordinate: [number, number] = [
+      routeCoordinates[routeCoordinates.length - 1][0],
+      routeCoordinates[routeCoordinates.length - 1][1],
+    ];
+
+    return routeCoordinates.length > 1
+      ? [
+          {
+            type: "Feature" as const,
+            properties: {
+              role: "start",
+              name: "Start",
+            },
+            geometry: {
+              type: "Point" as const,
+              coordinates: startCoordinate,
+            },
+          },
+          {
+            type: "Feature" as const,
+            properties: {
+              role: "end",
+              name: "End",
+            },
+            geometry: {
+              type: "Point" as const,
+              coordinates: endCoordinate,
+            },
+          },
+        ]
+      : [
+          {
+            type: "Feature" as const,
+            properties: {
+              role: "single",
+              name: "Start",
+            },
+            geometry: {
+              type: "Point" as const,
+              coordinates: startCoordinate,
+            },
+          },
+        ];
+  }
+
+  if (originCoordinate) {
+    return [
+      {
+        type: "Feature" as const,
+        properties: {
+          role: "start",
+          name: "Start",
+        },
+        geometry: {
+          type: "Point" as const,
+          coordinates: originCoordinate,
+        },
+      },
+    ];
+  }
+
+  return [];
+};
+
 export function ScenicMap({
   routeCoordinates,
   fallbackCenter = [-0.1278, 51.5074],
   highlightedLocation = null,
+  originCoordinate = null,
+  onMapPinDrop,
 }: ScenicMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<mapboxgl.Map | null>(null);
@@ -53,6 +127,13 @@ export function ScenicMap({
     });
 
     map.addControl(new mapboxgl.NavigationControl({ visualizePitch: true }), "top-right");
+
+    map.on("click", (event) => {
+      onMapPinDrop?.({
+        lat: event.lngLat.lat,
+        lng: event.lngLat.lng,
+      });
+    });
 
     map.on("load", () => {
       map.addSource(SOURCE_ID, {
@@ -135,7 +216,7 @@ export function ScenicMap({
         type: "geojson",
         data: {
           type: "FeatureCollection",
-          features: [],
+          features: buildEndpointFeatures(routeCoordinates, originCoordinate),
         },
       });
 
@@ -201,7 +282,7 @@ export function ScenicMap({
       mapRef.current = null;
       hasInitializedRef.current = false;
     };
-  }, [fallbackCenter, routeCoordinates, token]);
+  }, [fallbackCenter, onMapPinDrop, originCoordinate, routeCoordinates, token]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -228,63 +309,10 @@ export function ScenicMap({
       },
     });
 
-    if (routeCoordinates && routeCoordinates.length > 0) {
-      const startCoordinate: [number, number] = [routeCoordinates[0][0], routeCoordinates[0][1]];
-      const endCoordinate: [number, number] = [
-        routeCoordinates[routeCoordinates.length - 1][0],
-        routeCoordinates[routeCoordinates.length - 1][1],
-      ];
-
-      const endpointFeatures =
-        routeCoordinates.length > 1
-          ? [
-              {
-                type: "Feature" as const,
-                properties: {
-                  role: "start",
-                  name: "Start",
-                },
-                geometry: {
-                  type: "Point" as const,
-                  coordinates: startCoordinate,
-                },
-              },
-              {
-                type: "Feature" as const,
-                properties: {
-                  role: "end",
-                  name: "End",
-                },
-                geometry: {
-                  type: "Point" as const,
-                  coordinates: endCoordinate,
-                },
-              },
-            ]
-          : [
-              {
-                type: "Feature" as const,
-                properties: {
-                  role: "single",
-                  name: "Start",
-                },
-                geometry: {
-                  type: "Point" as const,
-                  coordinates: startCoordinate,
-                },
-              },
-            ];
-
-      endpointSource.setData({
-        type: "FeatureCollection",
-        features: endpointFeatures,
-      });
-    } else {
-      endpointSource.setData({
-        type: "FeatureCollection",
-        features: [],
-      });
-    }
+    endpointSource.setData({
+      type: "FeatureCollection",
+      features: buildEndpointFeatures(routeCoordinates, originCoordinate),
+    });
 
     if (routeCoordinates && routeCoordinates.length > 1) {
       const bounds = routeCoordinates.reduce(
@@ -300,7 +328,7 @@ export function ScenicMap({
         duration: 700,
       });
     }
-  }, [routeCoordinates]);
+  }, [originCoordinate, routeCoordinates]);
 
   useEffect(() => {
     const map = mapRef.current;
