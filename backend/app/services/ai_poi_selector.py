@@ -237,8 +237,9 @@ async def _rank_with_langgraph(
     if not _env_flag("AI_POI_LANGGRAPH_ENABLED", True):
         return []
 
-    openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not openai_api_key:
+    # Prefer OpenRouter for prototype usage, but allow OPENAI_API_KEY as a fallback.
+    llm_api_key = os.getenv("OPENROUTER_API_KEY", "").strip() or os.getenv("OPENAI_API_KEY", "").strip()
+    if not llm_api_key:
         return []
 
     try:
@@ -276,10 +277,11 @@ async def _rank_with_langgraph(
     }
 
     llm = ChatOpenAI(
-        model=os.getenv("AI_POI_SELECTOR_MODEL", "gpt-4o-mini"),
+        model=os.getenv("AI_POI_SELECTOR_MODEL", "meta-llama/llama-3.3-8b-instruct:free"),
         temperature=0,
         timeout=8,
-        api_key=openai_api_key,
+        api_key=llm_api_key,
+        base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
     )
 
     async def rank_node(state: _AgentState) -> _AgentState:

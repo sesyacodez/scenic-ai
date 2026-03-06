@@ -6,14 +6,14 @@ This folder is the implementation source of truth for ScenicAI.
 
 When docs conflict, use this order:
 
-1. `docs/PRD.md`
-2. `docs/design-brief.md`
-3. Architecture and contracts in this folder
-4. Engineering rules in this folder
+1. Architecture and contracts in this folder
+2. Engineering rules in this folder
+3. `docs/PRD.md` (product intent)
+4. `docs/design-brief.md` (design intent)
 
 ## Decisions Locked for MVP
 
-- Architecture: Next.js frontend + FastAPI backend + LangGraph agent orchestration
+- Architecture: Next.js frontend + FastAPI backend + deterministic route/scoring services + optional LangGraph POI ranking
 - Routing provider: Mapbox Directions API (`mapbox/walking`)
 - Conversation persistence: browser `localStorage` (versioned schema)
 - Auth: anonymous demo (no login)
@@ -33,7 +33,8 @@ When docs conflict, use this order:
 - [ ] Browser geolocation with manual fallback
 - [ ] Generate 3 route alternatives
 - [ ] Scenic score per route using weighted criteria
-- [ ] Agent orchestrates parse → constraints → route tool → score tool → rank → explanation
+- [ ] Optional AI selects must-see waypoint when destination is present
+- [ ] Route generation + scoring + ranking remain deterministic without LLM
 - [ ] Conversational refinements persist for session continuity
 - [ ] Response target under 5 seconds for typical requests
 - [ ] Mobile-responsive layout with map-first focus

@@ -1,62 +1,60 @@
-# LangGraph Agent Workflow
+# AI Waypoint Selection Workflow
 
-## Graph Nodes
+## Scope
 
-1. `intent_parse`
-   - Input: user text + current constraints
-   - Output: structured intent deltas (e.g., shorter, more water)
+LangGraph is used only in the optional must-see POI ranking step.
+Route generation, scenic scoring, route ranking, and explanation construction are deterministic backend services.
 
-2. `constraint_structure`
-   - Input: parsed intent + defaults
-   - Output: canonical constraints object
+## When It Runs
 
-3. `graph_construction`
-   - Input: origin + target duration + constraints
-   - Output: weighted street graph + edge feature map
+AI waypoint selection is attempted only when all conditions are true:
 
-4. `route_optimization`
-   - Input: weighted graph + planner weighting parameters
-   - Output: 3 candidate graph paths (Mapbox probe fallback if graph build fails)
+- `AI_POI_SELECTOR_ENABLED=true`
+- destination is provided
+- user did not provide waypoints
+- `GOOGLE_PLACES_API_KEY` is configured
 
-5. `scenic_score_tool`
-   - Input: graph paths + edge-level scenic features + preference weights
-   - Output: scored route list with component scores
+Otherwise, planning continues without AI-selected waypoints.
 
-6. `route_rank`
-   - Input: scored routes
-   - Output: selected route id + ordered list
+## Pipeline
 
-7. `explanation_gen`
-   - Input: selected route + score breakdown + constraints
-   - Output: short transparent explanation
+1. Candidate retrieval
+   - Query Google Places Text Search around route midpoint
+   - Merge and dedupe candidates by place id
 
-## State Contract
+2. Deterministic filtering
+   - Enforce geographic validity and detour constraints
+   - Drop candidates that violate duration/leg-distance constraints
 
-```json
-{
-  "origin": { "lat": 0, "lng": 0 },
-  "durationMinutes": 45,
-  "preferences": { "nature": 0.25, "water": 0.25, "historic": 0.25, "quiet": 0.25 },
-  "constraints": { "avoidBusyRoads": false },
-  "candidateRoutes": [],
-  "scoredRoutes": [],
-  "selectedRouteId": null,
-  "explanation": null
-}
-```
+3. Deterministic ranking baseline
+   - Compute heuristic relevance from rating, rating count, must-see type bonus, and preference-type matches
 
-## Transition Rules
+4. Optional LangGraph ranking
+   - If OpenRouter/OpenAI key is present and `AI_POI_LANGGRAPH_ENABLED=true`, run a single-node LangGraph that asks the LLM to return ordered place ids in strict JSON
+   - If this step fails, use heuristic ordering
 
-- Every node must write typed outputs to state
-- Any node validation failure routes to `error_exit`
-- Planner manages graph-weighting parameters (`k`, avoid-busy hard exclusion)
-- If graph construction/pathfinding fails, workflow falls back to Mapbox probe mode
-- If fallback returns <3 routes, workflow uses deterministic mock fallback
+5. Waypoint handoff
+   - Select up to `max_new_waypoints` POIs
+   - Return waypoint coordinates and selected POI metadata to planner
+
+## Output Contract (Selection Step)
+
+Selection returns:
+
+- `selectedWaypoints`: waypoint list used for route generation
+- `selectedPois`: named POIs with confidence/relevance metadata
+- `aiUsed`: whether AI selection was applied
+- `aiFallbackReason`: reason when AI path was skipped/unavailable
+- `aiSelectionMode`: `langgraph`, `heuristic`, or skip/unavailable mode code
+- `aiSelectionLatencyMs`: selection latency in milliseconds
 
 ## Determinism Policy
 
-- Routing and scoring nodes are deterministic
-- LLM is allowed only in:
-  - intent parsing
-  - explanation text generation
-- LLM outputs must be schema-validated before state write
+- Deterministic only:
+  - route generation
+  - scenic scoring and score breakdown
+  - route ranking and winner selection
+  - refinement transforms
+- Optional LLM use:
+  - POI ordering only
+- LLM or provider failure must never block route planning

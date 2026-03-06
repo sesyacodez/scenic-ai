@@ -31,9 +31,10 @@ These rules govern all MVP implementation work.
 
 ## Agent Rules
 
-- LLM calls only in intent parse and explanation generation nodes
-- All LLM outputs must be schema validated
-- If validation fails, fallback deterministic logic must keep flow functional
+- LLM calls are optional and currently limited to POI ordering in AI waypoint selection
+- Deterministic route generation, scoring, and ranking must never depend on LLM availability
+- LLM outputs must be strict-JSON parsed and validated before use
+- If AI selection fails, deterministic planning must continue without AI-selected waypoints
 
 ## UX and Accessibility Rules
 
